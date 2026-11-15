@@ -1,0 +1,288 @@
+// smpclient: the client half of SMP, for a host.
+//
+// A client sends requests to a server, reads the response and prints what the
+// commands of the OS, image and file groups return.  The request and the
+// response are `SmpBuf`s, so the client has the buffer sizes of the
+// configuration the package was built with.
+//
+// The packets travel through a `Transport` (smptransport.nv): the console
+// framing over a serial port, a pty or a TCP socket, or the packets as they
+// are over a pipe.  A request that is not answered within the timeout is sent
+// again, up to `tries` times; a response that does not belong to the request,
+// by its sequence number, is ignored.
+//
+// Every command answers a code: 0 for success, the server's code for a
+// request it refused, and -1 when no response arrived.
+
+use std.bytes
+use std.fs
+use smphdr
+use smpcbor
+use smpreq
+use smptransport
+
+var req: SmpBuf = Vec.new()
+var rsp: SmpBuf = Vec.new()
+var seq         = 0
+
+@tier(app)
+fn next_seq() -> Int [mutate]
+    seq = (seq + 1) & 0xFF
+    seq
+
+// The first `n` bytes of `req`.
+@tier(app)
+fn packet_of_req(n: Int) -> Bytes [mutate]
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, req[i] as Int)
+    bytes.from_byte_list(out)
+
+// Puts the packet `p` in `rsp`.  False when it does not fit.
+@tier(app)
+fn take_response(p: Bytes) -> Bool [mutate]
+    rsp.clear()
+    for i in 0..bytes.len(p)
+        match rsp.push((bytes.byte_at(p, i) ?? 0) as u8)
+            Ok(_)  => ()
+            Err(_) => return false
+    true
+
+// Sends the request of `n` bytes in `req` and reads its response into `rsp`.
+// Answers true when one arrived.
+@tier(app)
+fn exchange<T: Transport[e]>(t: T, n: Int, ms: Int, tries: Int) -> Bool [e, mutate]
+    let want = req[6] as Int
+    for _t in 0..tries
+        if not t.send(packet_of_req(n))
+            return false
+        for _b in 0..200000
+            match t.recv(ms)
+                None    => break
+                Some(p) =>
+                    if take_response(p)
+                        let h = smphdr.hdr_read(var rsp)
+                        if h.ok and h.seq == want
+                            return true
+    false
+
+@tier(app)
+fn check(ok: Bool) -> Int [mutate]
+    if not ok
+        return 0 - 1
+    smpreq.rc_of(var rsp)
+
+// Prints `echo`'s answer.
+@tier(app)
+pub fn echo<T: Transport[e]>(w: T, text: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
+    let n = smpreq.echo(var req, next_seq(), 0, text)
+    let rc = check(exchange(w, n, ms, tries))
+    if rc == 0
+        println(smpreq.text_of(var rsp, "r"))
+    rc
+
+// Prints the parameters of the server.
+@tier(app)
+pub fn params<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [io, e, mutate]
+    let n = smpreq.params(var req, next_seq(), 0)
+    let rc = check(exchange(w, n, ms, tries))
+    if rc == 0
+        println("buf_size ${smpreq.uint_of(var rsp, "buf_size", 0)} buf_count ${smpreq.uint_of(var rsp, "buf_count", 0)}")
+    rc
+
+// Asks the server to reset.
+@tier(app)
+pub fn reset<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
+    let n = smpreq.reset(var req, next_seq(), 0)
+    check(exchange(w, n, ms, tries))
+
+@tier(app)
+fn flag_text(at: Int, key: Str) -> Str [mutate]
+    if smpcbor.bool_or(var rsp, at, key, false)
+        return " ${key}"
+    ""
+
+// Prints the images in the response in `rsp`.
+@tier(app)
+fn print_images() [io, mutate]
+    let f = smpcbor.find(var rsp, SMP_HDR_BYTES, "images")
+    if not f.found or f.major != MAJOR_ARRAY
+        return
+    var at = f.at
+    for _k in 0..f.arg
+        let slot = smpcbor.uint_or(var rsp, at, "slot", 0)
+        let v = smpcbor.find(var rsp, at, "version")
+        var version = ""
+        var vs: [Int] = []
+        for i in 0..v.arg
+            list.push(vs, rsp[v.at + i] as Int)
+        version = bytes.to_str(bytes.from_byte_list(vs))
+        let h = smpcbor.find(var rsp, at, "hash")
+        var hs: [Int] = []
+        for i in 0..h.arg
+            list.push(hs, rsp[h.at + i] as Int)
+        println("image=${smpcbor.uint_or(var rsp, at, "image", 0)} slot=${slot}")
+        println("    version: ${version}")
+        println("    flags:${flag_text(at, "bootable")}${flag_text(at, "active")}${flag_text(at, "confirmed")}${flag_text(at, "pending")}${flag_text(at, "permanent")}")
+        println("    hash: ${bytes.to_hex(bytes.from_byte_list(hs))}")
+        at = smpcbor.map_end(var rsp, at)
+
+// Prints the image list.
+@tier(app)
+pub fn image_list<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [io, e, mutate]
+    let n = smpreq.image_list(var req, next_seq(), 0)
+    let rc = check(exchange(w, n, ms, tries))
+    if rc == 0
+        print_images()
+    rc
+
+// Marks the image whose hash is `hash` for a test at the next start, or
+// confirms it (`hash` empty confirms the image that runs).
+@tier(app)
+pub fn image_state<T: Transport[e]>(w: T, hash: Bytes, confirm: Bool, ms: Int,
+                               tries: Int) -> Int [io, e, mutate]
+    let n = smpreq.image_state(var req, next_seq(), 0, hash, confirm)
+    let rc = check(exchange(w, n, ms, tries))
+    if rc == 0
+        print_images()
+    rc
+
+// Erases the second slot.
+@tier(app)
+pub fn image_erase<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
+    let n = smpreq.image_erase(var req, next_seq(), 0)
+    check(exchange(w, n, ms, tries))
+
+// The most file bytes a request carries: what the buffer holds after the
+// header and the keys of the largest request.
+@tier(app)
+fn chunk_of(want: Int) -> Int
+    let room = req.capacity() - 96
+    if want > 0 and want < room
+        return want
+    room
+
+// Uploads the image `file`, a NOVB image or a package, a request at a time.
+// The server answers the offset it expects next and the client goes on from
+// there.  `chunk` is the most bytes of the file in a request, 0 for the most
+// the buffer holds.  Answers 0, the server's code, or -1 when the server
+// stopped answering.
+@tier(app)
+pub fn image_upload<T: Transport[e]>(w: T, file: Bytes, chunk: Int, ms: Int,
+                                tries: Int) -> Int [io, e, mutate]
+    image_upload_to(w, 0, file, chunk, ms, tries)
+
+// `image_upload` for the image `image`: 0 is the firmware, 1 the data region, whose file is the one
+// `novofs-tools mk --target` wrote.
+@tier(app)
+pub fn image_upload_to<T: Transport[e]>(w: T, image: Int, file: Bytes, chunk: Int, ms: Int,
+                                   tries: Int) -> Int [io, e, mutate]
+    let total = bytes.len(file)
+    let sha = bytes.zeros(0)
+    var off = 0
+    var sent = 0
+    for _r in 0..total + 16
+        if off < total
+            var n = total - off
+            if n > chunk_of(chunk)
+                n = chunk_of(chunk)
+            let m = smpreq.image_upload_to(var req, next_seq(), 0, image, file, off, n, sha, false)
+            let rc = check(exchange(w, m, ms, tries))
+            if rc != 0
+                return rc
+            sent = sent + 1
+            let at = smpreq.uint_of(var rsp, "off", off + n)
+            if at != off + n
+                println("server asks for offset ${at}")
+            off = at
+    println("uploaded ${total} bytes in ${sent} requests")
+    0
+
+// Uploads `file` as the file `name` of the server.
+@tier(app)
+pub fn fs_upload<T: Transport[e]>(w: T, name: Str, file: Bytes, ms: Int,
+                             tries: Int) -> Int [io, e, mutate]
+    let total = bytes.len(file)
+    var off = 0
+    for _r in 0..total + 16
+        if off < total or total == 0 and off == 0
+            var n = total - off
+            if n > chunk_of(0) - str.len(name)
+                n = chunk_of(0) - str.len(name)
+            let m = smpreq.fs_upload(var req, next_seq(), 0, name, file, off, n)
+            let rc = check(exchange(w, m, ms, tries))
+            if rc != 0
+                return rc
+            let at = smpreq.uint_of(var rsp, "off", off + n)
+            if total == 0
+                return 0
+            off = at
+    0
+
+// Prints the length of the file `name` of the server.
+@tier(app)
+pub fn fs_status<T: Transport[e]>(w: T, name: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
+    let n = smpreq.fs_status(var req, next_seq(), 0, name)
+    let rc = check(exchange(w, n, ms, tries))
+    if rc == 0
+        println("${name}: ${smpreq.uint_of(var rsp, "len", 0)} bytes")
+    rc
+
+// Prints the CRC-32 of the file `name` of the server, as eight hexadecimal digits.
+@tier(app)
+pub fn fs_hash<T: Transport[e]>(w: T, name: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
+    let n = smpreq.fs_hash(var req, next_seq(), 0, name, "crc32", 0, 0 - 1)
+    let rc = check(exchange(w, n, ms, tries))
+    if rc == 0
+        let v = smpreq.uint_of(var rsp, "output", 0)
+        var hex = ""
+        for i in 0..8
+            let d = (v >> (4 * (7 - i))) & 15
+            if d < 10
+                hex = hex + str.from_int(d)
+            else
+                hex = hex + str.from_char('a' + d - 10)
+        println("${name}: crc32 ${hex} over ${smpreq.uint_of(var rsp, "len", 0)} bytes")
+    rc
+
+// Asks the server to close the files of a transfer that stalled.
+@tier(app)
+pub fn fs_close<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
+    let n = smpreq.fs_close(var req, next_seq(), 0)
+    check(exchange(w, n, ms, tries))
+
+// Downloads the file `name` of the server.  Answers the code and, in `got`'s
+// place, writes the bytes to `path`.
+@tier(app)
+pub fn fs_download<T: Transport[e]>(w: T, name: Str, path: Str, ms: Int,
+                               tries: Int) -> Int [io, fs, e, mutate]
+    var all: [Int] = []
+    var off = 0
+    var total = 0 - 1
+    for _r in 0..100000
+        if total < 0 or off < total
+            let m = smpreq.fs_download(var req, next_seq(), 0, name, off)
+            let rc = check(exchange(w, m, ms, tries))
+            if rc != 0
+                return rc
+            total = smpreq.uint_of(var rsp, "len", 0)
+            let d = smpcbor.find(var rsp, SMP_HDR_BYTES, "data")
+            if not d.found or d.major != MAJOR_BYTES
+                return EINVAL
+            for i in 0..d.arg
+                list.push(all, rsp[d.at + i] as Int)
+            off = off + d.arg
+            if d.arg == 0
+                break
+    match fs.open_write(path)
+        None     =>
+            return EUNKNOWN
+        Some(fd) =>
+            let failed = fs.write_at(fd, 0, all)
+            fs.close(fd)
+            match failed
+                Some(_) =>
+                    return EUNKNOWN
+                None    => ()
+    println("downloaded ${off} bytes")
+    0

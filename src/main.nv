@@ -1,0 +1,9 @@
+// main: the `smp-client-nv` command, an SMP client for a bench.  The commands
+// are in smpcli.nv.
+
+use std.process
+use smpcli
+
+// cov: skip — the entry of the process: it runs when the binary does, and the suites call `smpcli.run` in its place
+fn main() [io, fs, net, mutate]
+    process.exit(smpcli.run(env.user_args()))

@@ -1,0 +1,264 @@
+// smpcli: the commands of the `smp-client-nv` program.
+//
+//   smp-client-nv --tcp HOST:PORT | --serial PATH [--baud N] | --dev PATH | --pipe PROGRAM
+//                 [--timeout MS] [--tries N] COMMAND
+//
+//   echo TEXT                 the server answers TEXT
+//   params                    the server's buffer size and count
+//   reset                     the server resets after it answers
+//   image list                the images the server holds
+//   image upload FILE [--image N]
+//                             sends a NOVB image or a package to the second slot; with --image 1 the
+//                             file `novofs-tools mk --target` wrote, to the data region
+//   image test HASH           marks the image with the hash (hex) for the next start
+//   image confirm [HASH]      confirms the image that runs, or makes the staged one permanent
+//   image erase               erases the second slot
+//   fs upload FILE NAME       sends FILE as the file NAME
+//   fs download NAME FILE     writes the file NAME to FILE
+//   fs status NAME            the length of the file NAME
+//   fs hash NAME              the CRC-32 of the file NAME
+//   fs close                  closes the files of a transfer that stalled
+//   pack IMAGE -o PACKAGE     wraps a NOVB image in the package of smppack.nv
+//   unpack PACKAGE -o IMAGE   takes the NOVB image out of a package
+//
+// `--tcp` and `--serial` carry the console framing of SMP over a socket and over a serial port, which
+// the program puts in raw mode at `--baud` (115200 when absent).  `--dev` is a descriptor used as it is,
+// such as a pty already in raw mode.  `--pipe` starts PROGRAM and talks to it in raw packets through its
+// standard input and output: the relay of noble-examples that reaches a device over Bluetooth Low Energy.
+// `run` answers the exit
+// status: 0 for success, 1 for a code the server answered or a file that
+// could not be read or written, 2 for a usage error and 3 when no answer
+// came.
+
+use std.bytes
+use std.fs
+use smpclient
+use smppack
+use smptransport
+
+@tier(app)
+fn usage() [io]
+    eprintln("usage: smp-client-nv (--tcp HOST:PORT | --serial PATH [--baud N] | --dev PATH | --pipe PROGRAM) [--timeout MS] [--tries N] COMMAND")
+    eprintln("  echo TEXT | params | reset | image list | image upload FILE | image test HASH")
+    eprintln("  image confirm [HASH] | image erase | fs upload FILE NAME | fs download NAME FILE")
+    eprintln("  fs status NAME | fs hash NAME | fs close | image upload FILE --image 1")
+    eprintln("usage: smp-client-nv pack IMAGE -o PACKAGE | unpack PACKAGE -o IMAGE")
+
+// The value after flag `name`, or `fallback`.
+@tier(app)
+pub fn flag(args: [Str], name: Str, fallback: Str) -> Str
+    for i in 0..args.len()
+        if args[i] == name and i + 1 < args.len()
+            return args[i + 1]
+    fallback
+
+// The arguments with the flags that take a value, and their values, removed.
+@tier(app)
+pub fn words(args: [Str]) -> [Str]
+    var out: [Str] = []
+    var skip = false
+    for a in args
+        if skip
+            skip = false
+        else if a == "--tcp" or a == "--dev" or a == "--serial" or a == "--baud" or a == "--pipe" or a == "--timeout" or a == "--tries" or a == "-o" or a == "--image"
+            skip = true
+        else
+            list.push(out, a)
+    out
+
+// The bytes of the hex string, empty when it is not one.
+@tier(app)
+pub fn from_hex(s: Str) -> Bytes
+    var out: [Int] = []
+    if str.len(s) % 2 != 0
+        return bytes.from_byte_list(out)
+    for i in 0..str.len(s) / 2
+        var v = 0
+        for j in 0..2
+            let c = str.byte_at_or(s, 2 * i + j, 0)
+            var d = 0 - 1
+            if c >= '0' and c <= '9'
+                d = c - '0'
+            else if c >= 'a' and c <= 'f'
+                d = c - 'a' + 10
+            else if c >= 'A' and c <= 'F'
+                d = c - 'A' + 10
+            if d < 0
+                return bytes.from_byte_list([])
+            v = v * 16 + d
+        list.push(out, v)
+    bytes.from_byte_list(out)
+
+// Writes `data` to the file `path`.
+@tier(app)
+pub fn write_file(path: Str, data: Bytes) -> Bool [fs]
+    var all: [Int] = []
+    for i in 0..bytes.len(data)
+        list.push(all, bytes.byte_at(data, i) ?? 0)
+    match fs.open_write(path)
+        None     => false
+        Some(fd) =>
+            let failed = fs.write_at(fd, 0, all)
+            fs.close(fd)
+            match failed
+                Some(_) => false
+                None    => true
+
+// pack and unpack need no server.
+@tier(app)
+fn files(args: [Str], w: [Str]) -> Int [io, fs]
+    let out = flag(args, "-o", "")
+    if w.len() < 2 or out == ""
+        usage()
+        return 2
+    match fs.read_bytes(w[1])
+        None    =>
+            eprintln("smp-client-nv: cannot read ${w[1]}")
+            return 1
+        Some(b) =>
+            var made = smppack.wrap(b)
+            if w[0] == "unpack"
+                made = smppack.unwrap(b)
+            if not write_file(out, made)
+                eprintln("smp-client-nv: cannot write ${out}")
+                return 1
+            println("${out}: ${bytes.len(made)} bytes")
+            0
+
+// The upload of the file `path`.
+@tier(app)
+fn upload<T: Transport[e]>(wire: T, path: Str, image: Int, ms: Int, tries: Int) -> Int [io, fs, e, mutate]
+    match fs.read_bytes(path)
+        None    =>
+            eprintln("smp-client-nv: cannot read ${path}")
+            1
+        Some(b) =>
+            smpclient.image_upload_to(wire, image, b, 0, ms, tries)
+
+// The upload of the file `path` as the file `name`.
+@tier(app)
+fn put_file<T: Transport[e]>(wire: T, path: Str, name: Str, ms: Int,
+                        tries: Int) -> Int [io, fs, e, mutate]
+    match fs.read_bytes(path)
+        None    =>
+            eprintln("smp-client-nv: cannot read ${path}")
+            1
+        Some(b) =>
+            smpclient.fs_upload(wire, name, b, ms, tries)
+
+// The image commands: list, upload, test, confirm, erase.  Answers -2 for
+// words that are none of them.
+@tier(app)
+fn image<T: Transport[e]>(wire: T, w: [Str], index: Int, ms: Int, tries: Int) -> Int [io, fs, e, mutate]
+    if w[1] == "list"
+        return smpclient.image_list(wire, ms, tries)
+    if w[1] == "erase"
+        return smpclient.image_erase(wire, ms, tries)
+    if w[1] == "upload" and w.len() >= 3
+        return upload(wire, w[2], index, ms, tries)
+    if w[1] == "test" and w.len() >= 3
+        return smpclient.image_state(wire, from_hex(w[2]), false, ms, tries)
+    if w[1] == "confirm"
+        var digest = bytes.from_byte_list([])
+        if w.len() >= 3
+            digest = from_hex(w[2])
+        return smpclient.image_state(wire, digest, true, ms, tries)
+    0 - 2
+
+// Runs the command in `w` over the wire.  Answers the code of the command,
+// -1 when no answer came and -2 when the words are no command.
+@tier(app)
+pub fn command<T: Transport[e]>(wire: T, w: [Str], ms: Int, tries: Int) -> Int [io, fs, e, mutate]
+    command_for(wire, w, 0, ms, tries)
+
+// `command` with the image an upload goes to: 0 is the firmware, 1 the data region.
+@tier(app)
+pub fn command_for<T: Transport[e]>(wire: T, w: [Str], index: Int, ms: Int,
+                               tries: Int) -> Int [io, fs, e, mutate]
+    if w.len() >= 2 and w[0] == "echo"
+        return smpclient.echo(wire, w[1], ms, tries)
+    if w.len() == 1 and w[0] == "params"
+        return smpclient.params(wire, ms, tries)
+    if w.len() == 1 and w[0] == "reset"
+        return smpclient.reset(wire, ms, tries)
+    if w.len() >= 2 and w[0] == "image"
+        return image(wire, w, index, ms, tries)
+    if w.len() >= 4 and w[0] == "fs" and w[1] == "upload"
+        return put_file(wire, w[2], w[3], ms, tries)
+    if w.len() >= 4 and w[0] == "fs" and w[1] == "download"
+        return smpclient.fs_download(wire, w[2], w[3], ms, tries)
+    if w.len() >= 3 and w[0] == "fs" and w[1] == "status"
+        return smpclient.fs_status(wire, w[2], ms, tries)
+    if w.len() >= 3 and w[0] == "fs" and w[1] == "hash"
+        return smpclient.fs_hash(wire, w[2], ms, tries)
+    if w.len() == 2 and w[0] == "fs" and w[1] == "close"
+        return smpclient.fs_close(wire, ms, tries)
+    0 - 2
+
+// The exit status for the code `rc` of a command.
+@tier(app)
+pub fn status(rc: Int) -> Int [io]
+    if rc == 0
+        return 0
+    if rc == 0 - 2
+        usage()
+        return 2
+    if rc < 0
+        eprintln("smp-client-nv: no answer")
+        return 3
+    eprintln("smp-client-nv: the server answered code ${rc}")
+    1
+
+// The program: the arguments, without the program's name, to its exit status.
+@tier(app)
+pub fn run(args: [Str]) -> Int [io, fs, net, mutate]
+    let w = words(args)
+    if w.len() < 1
+        usage()
+        return 2
+    if w[0] == "pack" or w[0] == "unpack"
+        return files(args, w)
+    let ms = str.to_int(flag(args, "--timeout", "10000")) ?? 10000
+    let tries = str.to_int(flag(args, "--tries", "3")) ?? 3
+    let index = str.to_int(flag(args, "--image", "0")) ?? 0
+    let tcp = flag(args, "--tcp", "")
+    let dev = flag(args, "--dev", "")
+    let serial = flag(args, "--serial", "")
+    let pipe = flag(args, "--pipe", "")
+    if tcp != ""
+        let parts = str.split(tcp, ":")
+        if parts.len() != 2
+            usage()
+            return 2
+        match smptransport.connect(parts[0], str.to_int(parts[1]) ?? 0, 3000)
+            None       =>
+                eprintln("smp-client-nv: cannot connect to ${tcp}")
+                return 3
+            Some(wire) =>
+                return status(command_for(wire, w, index, ms, tries))
+    if serial != ""
+        let baud = str.to_int(flag(args, "--baud", "115200")) ?? 115200
+        match smptransport.open_serial(serial, baud)
+            None       =>
+                eprintln("smp-client-nv: cannot open ${serial}")
+                return 3
+            Some(wire) =>
+                return status(command_for(wire, w, index, ms, tries))
+    if dev != ""
+        match smptransport.open_dev(dev)
+            None       =>
+                eprintln("smp-client-nv: cannot open ${dev}")
+                return 3
+            Some(wire) =>
+                return status(command_for(wire, w, index, ms, tries))
+    if pipe != ""
+        match smptransport.spawn_pipe(str.split(pipe, " "))
+            None       =>
+                eprintln("smp-client-nv: cannot start ${pipe}")
+                return 3
+            Some(wire) =>
+                let rc = status(command_for(wire, w, index, ms, tries))
+                proc.close(wire.wire.pid)
+                return rc
+    usage()
+    2

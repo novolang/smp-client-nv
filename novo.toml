@@ -1,0 +1,32 @@
+[package]
+name        = "smp-client-nv"
+version     = "0.1.0"
+description = "The client half of SMP, the Simple Management Protocol of MCUmgr, for a host: a Transport trait with the console framing over a serial port, a pty or a TCP socket and the packets as they are over a pipe, the commands of the OS, image and file groups, and two programs: smp-client-nv, which also packs the file nRF Connect Device Manager reads, and novo-update, which the toolchain runs as `novo update` to update a board and write its data region."
+license     = "Apache-2.0"
+stability   = "experimental"
+
+# `host`: a client opens a serial port, a socket or a pipe, reads and writes files and prints.
+layer       = "host"
+
+category    = "embedded"
+tags        = ["mcumgr", "smp", "dfu", "fota", "firmware-update", "bootloader", "serial", "client", "cli"]
+repository  = "https://github.com/novolang/smp-client-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.25.0"
+
+# The command `smp-client-nv`: echo, params, reset, image list/upload/test/confirm/erase, fs upload/download/status/hash/close, pack and unpack,
+# over a serial port, a TCP socket, a descriptor or a pipe.
+main        = "src/main.nv"
+
+# `novo update`: the command the toolchain runs for a verb it does not know, built as `novo-update` and installed beside `novo`.
+[[bin]]
+name = "novo-update"
+path = "src/update_main.nv"
+
+[docs.pages]
+"README.md" = "The client half of SMP, for a host"
+
+[dependencies]
+# The protocol: the header, the CBOR of a body, the console framing and the request builders, and the server the suites run the client against.
+# A path until mcumgr-nv 0.2.0 is published (PATH-DEPENDENCIES.md of the satellites folder); the range it becomes is `^0.2.0`.
+mcumgr-nv = { path = "../mcumgr-nv" }

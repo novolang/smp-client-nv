@@ -1,0 +1,16 @@
+// image_b: the firmware an update brings, in slot B after an upload.
+//
+// Built like image_a.  It blinks faster, so that its bytes, and therefore its
+// SHA-256, differ from image_a's.
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    let led = bsp.board.led1()
+    hal.gpio.mode(led, 1)
+    var i = 0
+    while true
+        hal.gpio.set(led, i % 2)
+        hal.watchdog.feed()
+        hal.timer.delay_ms(125)
+        i = i + 1

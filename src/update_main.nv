@@ -1,0 +1,8 @@
+// update_main: the `novo-update` command, which `novo update` runs.  The commands are in update.nv.
+
+use std.process
+use update
+
+// cov: skip — the entry of the process: it runs when the binary does, and the suites call `update.run_in` in its place
+fn main() [io, fs, net, time, mutate]
+    process.exit(update.run(env.user_args()))

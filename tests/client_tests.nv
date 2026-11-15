@@ -1,0 +1,509 @@
+// client_tests: the host client against a server in the same process.
+//
+//   novo test tests/client_tests.nv
+//
+// `Loop` is a `Wire` whose far end is a session: what the client sends is fed
+// to the session a byte at a time, and what the session writes is what the
+// client reads.  `Lossy` loses responses, and `Mute` never answers.  The
+// last tests open a socket, a pipe to `cat` and `/dev/null`, which are the
+// ways the command reaches a real server.
+
+use std.test
+use std.bytes
+use std.fs
+use std.net
+use std.process
+use bootram
+use hostimg
+use smphdr
+use smpcbor
+use smpserial
+use smprsp
+use smpstate
+use smpsess
+use smpboot
+use smpsim
+use smpram
+use smpclient
+use smpcli
+use smppack
+use smptransport
+
+let CHIP  = 0x413
+let BOARD = 0x96A06A37
+let HB    = 256
+
+var srv          = smpstate.session()
+var ram          = bootram.ram_slots(256, 64)
+var inbox: [Int] = []
+var at           = 0
+var drop         = 0
+var sent         = 0
+
+@value
+struct SrvPort
+    id: Int
+
+impl SmpPort[mutate] for SrvPort
+    fn take_byte(self) -> Int [mutate]
+        0 - 1
+
+    fn put_byte(self, b: Int) [mutate]
+        if drop <= 0
+            list.push(inbox, b)
+
+// A wire to the session.  While `drop` is above 0 the answers to that many
+// requests are lost.
+@value
+struct Loop
+    id: Int
+
+impl Wire[mutate] for Loop
+    fn send(self, data: Bytes) -> Bool [mutate]
+        sent = sent + 1
+        for i in 0..bytes.len(data)
+            let done = smpsess.feed(smpboot.ram_store(ram), smpsim.sim_os(ram), RamFile { id: 0 }, SrvPort { id: 0 },
+                                    var srv, bytes.byte_at(data, i) ?? 0)
+            if done and drop > 0
+                drop = drop - 1
+        true
+
+    fn recv(self, ms: Int) -> Int [mutate]
+        if at < inbox.len()
+            let v = inbox[at]
+            at = at + 1
+            return v
+        0 - 1
+
+// A wire that cannot send.
+@value
+struct Deaf
+    id: Int
+
+impl Wire[mutate] for Deaf
+    fn send(self, data: Bytes) -> Bool [mutate]
+        false
+
+    fn recv(self, ms: Int) -> Int [mutate]
+        0 - 1
+
+fn lp() -> Framed<Loop>
+    Framed { wire: Loop { id: 0 } }
+
+fn dp() -> Framed<Deaf>
+    Framed { wire: Deaf { id: 0 } }
+
+fn fresh() [mutate]
+    ram = bootram.ram_slots(256, 64)
+    smpboot.set_policy(HB, CHIP, BOARD, 0)
+    srv = smpstate.session()
+    inbox = []
+    at = 0
+    drop = 0
+    sent = 0
+    let _ = smpram.ram_file()
+
+fn put_slot(slot: Int, img: Bytes) [mutate]
+    for i in 0..bytes.len(img)
+        bootram.poke(slot, i, bytes.byte_at(img, i) ?? 0xFF)
+
+fn payload(n: Int, salt: Int) -> Bytes
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, (i * 11 + salt) & 0xFF)
+    bytes.from_byte_list(out)
+
+fn image(version: Int, n: Int, salt: Int) -> Bytes
+    hostimg.image(CHIP, BOARD, HB, version, salt, true, payload(n, salt))
+
+fn tmp(name: Str) -> Str
+    "/tmp/mcumgr_nv_client_${process.pid()}_${name}"
+
+@test
+fn test_echo_params_and_reset_are_answered() [io, fs, mutate]
+    fresh()
+    test.assert_eq(smpclient.echo(lp(), "ping", 100, 1), 0)
+    test.assert_eq(smpclient.params(lp(), 100, 1), 0)
+    test.assert_eq(smpclient.reset(lp(), 100, 1), 0)
+
+@test
+fn test_a_lost_response_is_asked_for_again() [io, fs, mutate]
+    fresh()
+    drop = 2
+    let before = sent
+    test.assert_eq(smpclient.echo(lp(), "retry", 100, 3), 0)
+    test.assert_eq(sent - before, 3)
+
+    test.case("with one try the loss is the answer")
+    drop = 1
+    test.assert_eq(smpclient.echo(lp(), "once", 100, 1), 0 - 1)
+
+    test.case("a response to another request is passed over")
+    inbox = []
+    at = 0
+    drop = 0
+    // A stale answer sits in the inbox before the real one.
+    smpserial.send(SrvPort { id: 0 }, var srv.tx, 0)
+    test.assert_eq(smpclient.echo(lp(), "fresh", 100, 1), 0)
+
+    test.case("a wire that cannot send, and a server that never answers")
+    test.assert_eq(smpclient.echo(dp(), "x", 10, 1), 0 - 1)
+    test.assert_eq(smpclient.echo(dp(), "x", 10, 2), 0 - 1)
+
+@test
+fn test_an_image_goes_up_is_listed_tested_and_confirmed() [io, fs, mutate]
+    fresh()
+    let old = image(0x01000000, 2000, 9)
+    let img = image(0x01020003, 3000, 1)
+    put_slot(0, old)
+    test.assert_eq(smpclient.image_list(lp(), 100, 1), 0)
+    test.assert_eq(smpclient.image_upload(lp(), img, 200, 100, 1), 0)
+    test.assert_eq(smpclient.image_list(lp(), 100, 1), 0)
+    let digest = bytes.slice(img, 0x20, 0x40)
+    test.assert_eq(smpclient.image_state(lp(), digest, false, 100, 1), 0)
+    test.assert_eq(smpclient.reset(lp(), 100, 1), 0)
+    test.assert_eq(smpclient.image_list(lp(), 100, 1), 0)
+    test.assert_eq(smpclient.image_state(lp(), bytes.zeros(0), true, 100, 1), 0)
+    test.assert_eq(smpclient.image_erase(lp(), 100, 1), 0)
+
+    test.case("the largest request the buffer holds is used when no chunk is asked for")
+    fresh()
+    put_slot(0, old)
+    test.assert_eq(smpclient.image_upload(lp(), img, 0, 100, 1), 0)
+
+    test.case("a refused image is the server's code")
+    fresh()
+    let other = hostimg.image(0x999, BOARD, HB, 1, 1, true, payload(500, 1))
+    test.assert_eq(smpclient.image_upload(lp(), other, 200, 100, 1), EINVAL)
+
+    test.case("a server that restarts from the beginning is followed")
+    fresh()
+    put_slot(0, old)
+    let m = smpclient.image_upload(lp(), img, 200, 100, 1)
+    test.assert_eq(m, 0)
+
+@test
+fn test_a_package_and_a_file_travel_whole() [io, fs, mutate]
+    fresh()
+    let img = image(0x01020003, 1200, 3)
+    let pkg = smppack.wrap(img)
+    test.assert_eq(smpclient.image_upload(lp(), pkg, 150, 100, 1), 0)
+    let file = payload(600, 7)
+    test.assert_eq(smpclient.fs_upload(lp(), "/data/log", file, 100, 1), 0)
+    let out = tmp("down")
+    test.assert_eq(smpclient.fs_download(lp(), "/data/log", out, 100, 1), 0)
+    match fs.read_bytes(out)
+        None    => test.assert(false)
+        Some(b) =>
+            test.assert_eq(bytes.len(b), 600)
+            test.assert_eq(bytes.byte_at(b, 599) ?? 0 - 1, bytes.byte_at(file, 599) ?? 0 - 2)
+            test.assert_eq(bytes.byte_at(b, 300) ?? 0 - 1, bytes.byte_at(file, 300) ?? 0 - 2)
+    let _ = fs.delete(out)
+
+    test.case("an empty file, a missing file, a refused file and an unwritable target")
+    test.assert_eq(smpclient.fs_upload(lp(), "/empty", bytes.zeros(0), 100, 1), 0)
+    let nothing = tmp("none")
+    test.assert_eq(smpclient.fs_download(lp(), "/empty", nothing, 100, 1), 0)
+    test.assert_eq(smpclient.fs_download(lp(), "/absent", nothing, 100, 1), ENOENT)
+    test.assert_eq(smpclient.fs_upload(lp(), "/big", payload(mcumgr_nv.CONFIG.MAX_FILE_BYTES + 1, 1), 100, 1), EMSGSIZE)
+    test.assert_eq(smpclient.fs_download(lp(), "/empty", "/nonexistent-dir/x", 100, 1), EUNKNOWN)
+    let _ = fs.delete(nothing)
+
+@test
+fn test_the_commands_of_the_program() [io, fs, net, mutate]
+    fresh()
+    let w = lp()
+    test.assert_eq(smpcli.command(w, ["echo", "hi"], 100, 1), 0)
+    test.assert_eq(smpcli.command(w, ["params"], 100, 1), 0)
+    test.assert_eq(smpcli.command(w, ["image", "list"], 100, 1), 0)
+    test.assert_eq(smpcli.command(w, ["image", "erase"], 100, 1), 0)
+    test.assert_eq(smpcli.command(w, ["image", "confirm"], 100, 1), ENOENT)
+    test.assert_eq(smpcli.command(w, ["image", "test", "zz"], 100, 1), EINVAL)
+    test.assert_eq(smpcli.command(w, ["image", "frob"], 100, 1), 0 - 2)
+    test.assert_eq(smpcli.command(w, ["frob"], 100, 1), 0 - 2)
+    test.assert_eq(smpcli.command(w, ["reset"], 100, 1), 0)
+
+    test.case("a file goes up and comes back by name")
+    let src = tmp("src")
+    let dst = tmp("dst")
+    test.assert(smpcli.write_file(src, payload(300, 2)))
+    test.assert_eq(smpcli.command(w, ["fs", "upload", src, "/n"], 100, 1), 0)
+    test.assert_eq(smpcli.command(w, ["fs", "download", "/n", dst], 100, 1), 0)
+    match fs.read_bytes(dst)
+        None    => test.assert(false)
+        Some(b) => test.assert_eq(bytes.len(b), 300)
+    test.assert_eq(smpcli.command(w, ["fs", "upload", "/no/such/file", "/n"], 100, 1), 1)
+    test.assert_eq(smpcli.command(w, ["image", "upload", "/no/such/file"], 100, 1), 1)
+
+    test.case("an image file goes up")
+    fresh()
+    let img = image(0x01020003, 900, 4)
+    test.assert(smpcli.write_file(src, img))
+    test.assert_eq(smpcli.command(w, ["image", "upload", src], 100, 1), 0)
+    let _ = fs.delete(src)
+    let _ = fs.delete(dst)
+
+@test
+fn test_a_device_is_opened_by_its_path() [io, fs, net, mutate]
+    match smptransport.open_dev("/dev/null")
+        None    => test.assert(false)
+        Some(w) => test.assert_eq(w.wire.recv(20), 0 - 1)
+    match smptransport.open_dev("/nonexistent/dev")
+        None    => ()
+        Some(_) => test.assert(false)
+
+@test
+fn test_the_words_of_a_command_line() [io, fs, net, mutate]
+    test.assert_eq(smpcli.flag(["--tcp", "h:1", "echo"], "--tcp", "x"), "h:1")
+    test.assert_eq(smpcli.flag(["--tcp"], "--tcp", "x"), "x")
+    test.assert_eq(smpcli.flag([], "--dev", "none"), "none")
+    let w = smpcli.words(["--dev", "/d", "echo", "-o", "f", "hi", "--timeout", "5"])
+    test.assert_eq(w.len(), 2)
+    test.assert_eq(w[0], "echo")
+    test.assert_eq(w[1], "hi")
+    test.assert_eq(bytes.len(smpcli.from_hex("00ff7A")), 3)
+    test.assert_eq(bytes.byte_at(smpcli.from_hex("00ff7A"), 2) ?? 0 - 1, 0x7A)
+    test.assert_eq(bytes.len(smpcli.from_hex("0")), 0)
+    test.assert_eq(bytes.len(smpcli.from_hex("0g")), 0)
+    test.assert_eq(smpcli.status(0), 0)
+    test.assert_eq(smpcli.status(5), 1)
+    test.assert_eq(smpcli.status(0 - 1), 3)
+    test.assert_eq(smpcli.status(0 - 2), 2)
+
+@test
+fn test_pack_and_unpack_through_the_program() [io, fs, net, mutate]
+    let img = tmp("img")
+    let pkg = tmp("pkg")
+    let back = tmp("back")
+    test.assert(smpcli.write_file(img, image(0x01020003, 700, 6)))
+    test.assert_eq(smpcli.run(["pack", img, "-o", pkg]), 0)
+    test.assert_eq(smpcli.run(["unpack", pkg, "-o", back]), 0)
+    match fs.read_bytes(back)
+        None    => test.assert(false)
+        Some(b) => test.assert_eq(bytes.len(b), 256 + 700)
+    test.assert_eq(smpcli.run(["pack", img]), 2)
+    test.assert_eq(smpcli.run(["pack", "/no/such/image", "-o", pkg]), 1)
+    test.assert_eq(smpcli.run(["pack", img, "-o", "/nonexistent-dir/x"]), 1)
+    test.assert_eq(smpcli.run([]), 2)
+    test.assert_eq(smpcli.run(["echo", "x"]), 2)
+    let _ = fs.delete(img)
+    let _ = fs.delete(pkg)
+    let _ = fs.delete(back)
+
+@test
+fn test_the_program_reaches_a_socket_and_a_device() [io, fs, net, mutate]
+    // Nothing listens on port 1.
+    test.assert_eq(smpcli.run(["--tcp", "127.0.0.1:1", "--timeout", "50", "--tries", "1", "echo", "x"]), 3)
+    test.assert_eq(smpcli.run(["--tcp", "127.0.0.1", "echo", "x"]), 2)
+    test.assert_eq(smpcli.run(["--dev", "/nonexistent/dev", "echo", "x"]), 3)
+    // A device that answers nothing: /dev/null reads as the end of a stream.
+    test.assert_eq(smpcli.run(["--dev", "/dev/null", "--timeout", "50", "--tries", "1", "echo", "x"]), 3)
+    test.assert_eq(smpcli.run(["--dev", "/dev/null", "--timeout", "50", "--tries", "1", "frob"]), 2)
+    // A listener that never answers.
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            test.assert_eq(smpcli.run(["--tcp", "127.0.0.1:${port}", "--timeout", "50", "--tries", "1", "echo", "x"]),
+                3)
+            net.close(server)
+
+@test
+fn test_a_tcp_wire_reads_what_the_peer_sends() [io, fs, net, mutate]
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            match smptransport.connect("127.0.0.1", port, 1000)
+                None       => test.assert(false)
+                Some(framed) =>
+                    let wire = framed.wire
+                    match net.accept(server)
+                        None            => test.assert(false)
+                        Some((peer, _)) =>
+                            test.assert(wire.send(bytes.from_str("ab")))
+                            test.assert_eq(wire.recv(20), 0 - 1)
+                            test.assert(net.send_bytes(peer, bytes.from_str("xyz")))
+                            test.assert_eq(wire.recv(1000), 'x')
+                            test.assert_eq(wire.recv(1000), 'y')
+                            test.assert_eq(wire.recv(1000), 'z')
+                            test.assert_eq(wire.recv(20), 0 - 1)
+                            net.close(peer)
+                            test.assert_eq(wire.recv(1000), 0 - 1)
+            net.close(server)
+
+@test
+fn test_a_device_wire_writes_and_reads_a_descriptor() [io, fs, net, mutate]
+    match proc.spawn(["cat"])
+        None      => test.assert(false)
+        Some(pid) =>
+            let w = DevWire { fd: proc.stdin_fd(pid) }
+            let r = DevWire { fd: proc.stdout_fd(pid) }
+            test.assert(w.send(bytes.from_str("hello")))
+            test.assert_eq(r.recv(2000), 'h')
+            test.assert_eq(r.recv(2000), 'e')
+            test.assert_eq(r.recv(2000), 'l')
+            test.assert_eq(r.recv(2000), 'l')
+            test.assert_eq(r.recv(2000), 'o')
+            test.assert_eq(r.recv(20), 0 - 1)
+            proc.close(pid)
+
+// ── A server that answers as the test says ──────────────────────────────
+
+var sreq: SmpBuf  = Vec.new()
+var sresp: SmpBuf = Vec.new()
+var slink         = smpserial.rx_new()
+var smode         = 0
+var sout: [Int]   = []
+var sat           = 0
+
+@value
+struct Frames
+    id: Int
+
+impl SmpPort[mutate] for Frames
+    fn take_byte(self) -> Int [mutate]
+        0 - 1
+
+    fn put_byte(self, b: Int) [mutate]
+        list.push(sout, b)
+
+// The body of the answer for mode `smode`:
+//   1 an empty map, 2 an image list with no image, 3 a download with no data,
+//   4 an upload answer that asks for 10 bytes more than were sent.
+fn answer(h: SmpHdr) -> Int [mutate]
+    smprsp.begin(var sresp, h)
+    if smode == 2
+        smpcbor.put_head(var sresp, MAJOR_MAP, 1)
+        smpcbor.put_text(var sresp, "images")
+        smpcbor.put_head(var sresp, MAJOR_ARRAY, 0)
+    else if smode == 3
+        smpcbor.put_head(var sresp, MAJOR_MAP, 2)
+        smpcbor.put_uint(var sresp, "off", 0)
+        smpcbor.put_uint(var sresp, "len", 10)
+    else if smode == 4
+        let off = smpcbor.uint_or(var sreq, SMP_HDR_BYTES, "off", 0)
+        let d = smpcbor.find(var sreq, SMP_HDR_BYTES, "data")
+        smpcbor.put_head(var sresp, MAJOR_MAP, 1)
+        smpcbor.put_uint(var sresp, "off", off + d.arg + 10)
+    else
+        smpcbor.put_head(var sresp, MAJOR_MAP, 0)
+    smprsp.finish(var sresp)
+
+@value
+struct Script
+    id: Int
+
+impl Wire[mutate] for Script
+    fn send(self, data: Bytes) -> Bool [mutate]
+        for i in 0..bytes.len(data)
+            let n = smpserial.rx_byte(var slink, var sreq, bytes.byte_at(data, i) ?? 0)
+            if n > 0
+                let h = smphdr.hdr_read(var sreq)
+                let m = answer(h)
+                smpserial.send(Frames { id: 0 }, var sresp, m)
+        true
+
+    fn recv(self, ms: Int) -> Int [mutate]
+        if sat < sout.len()
+            let v = sout[sat]
+            sat = sat + 1
+            return v
+        0 - 1
+
+fn sc() -> Framed<Script>
+    Framed { wire: Script { id: 0 } }
+
+fn script(mode: Int) [mutate]
+    smode = mode
+    slink = smpserial.rx_new()
+    sout = []
+    sat = 0
+
+@test
+fn test_answers_that_lack_what_the_command_prints_are_survived() [io, fs, net, mutate]
+    script(1)
+    test.assert_eq(smpclient.image_list(sc(), 100, 1), 0)
+    test.assert_eq(smpclient.echo(sc(), "x", 100, 1), 0)
+    script(2)
+    test.assert_eq(smpclient.image_list(sc(), 100, 1), 0)
+
+    test.case("a download answer with no data is refused by the client")
+    script(3)
+    test.assert_eq(smpclient.fs_download(sc(), "/f", tmp("none"), 100, 1), EINVAL)
+
+    test.case("a server that asks for another offset is followed")
+    script(4)
+    test.assert_eq(smpclient.image_upload(sc(), payload(100, 1), 40, 100, 1), 0)
+    script(4)
+    test.assert_eq(smpclient.fs_upload(sc(), "/f", payload(100, 1), 100, 1), 0)
+
+@test
+fn test_a_file_that_cannot_be_written_is_the_error() [io, fs, net, mutate]
+    fresh()
+    test.assert_eq(smpclient.fs_upload(lp(), "/f", payload(20, 1), 100, 1), 0)
+    // /dev/full accepts the open and refuses every write.
+    test.assert_eq(smpclient.fs_download(lp(), "/f", "/dev/full", 100, 1), EUNKNOWN)
+    test.assert(not smpcli.write_file("/dev/full", payload(20, 1)))
+    test.assert_eq(smpcli.command(lp(), ["image", "confirm", "00"], 100, 1), EINVAL)
+
+@test
+fn test_a_package_unwraps_to_its_image_and_a_bare_image_to_itself() [io, fs, net, mutate]
+    let img = image(0x01020003, 300, 8)
+    test.assert_eq(bytes.len(smppack.unwrap(img)), bytes.len(img))
+    test.assert_eq(bytes.len(smppack.unwrap(smppack.wrap(img))), bytes.len(img))
+    test.assert(smppack.is_package(smppack.wrap(img)))
+    test.assert(not smppack.is_package(img))
+
+// A transport whose answer is larger than the buffer.
+@value
+struct Oversize
+    id: Int
+
+impl Transport[mutate] for Oversize
+    fn send(self, packet: Bytes) -> Bool [mutate]
+        true
+
+    fn recv(self, ms: Int) -> ?Bytes [mutate]
+        if sent > 2
+            return None
+        sent = sent + 1
+        Some(bytes.zeros(mcumgr_nv.CONFIG.SMP_BUF_BYTES + 100))
+
+// A wire that never stops sending bytes that frame nothing.
+@value
+struct Junk
+    id: Int
+
+impl Wire[mutate] for Junk
+    fn send(self, data: Bytes) -> Bool [mutate]
+        true
+
+    fn recv(self, ms: Int) -> Int [mutate]
+        'A'
+
+@test
+fn test_an_answer_larger_than_the_buffer_is_passed_over_and_junk_ends_the_wait() [io, fs, net, mutate]
+    sent = 0
+    test.assert_eq(smpclient.echo(Oversize { id: 0 }, "x", 10, 2), 0 - 1)
+    test.assert(sent > 2)
+    match Framed { wire: Junk { id: 0 } }.recv(10)
+        None    => ()
+        Some(_) => test.assert(false)
+
+@test
+fn test_the_program_reaches_a_serial_port_and_a_pipe() [io, fs, net, mutate]
+    let bin = tmp("serbin")
+    test.assert(fs.mkdir_all(bin))
+    test.assert(fs.write("${bin}/stty", "#!/bin/sh\nexit 0\n"))
+    test.assert(fs.set_file_mode("${bin}/stty", 0o755))
+    let old = process.env("PATH") ?? ""
+    process.env_set("PATH", "${bin}:${old}")
+    // /dev/null reads as the end of a stream: the command is not answered.
+    test.assert_eq(smpcli.run(["--serial", "/dev/null", "--baud", "9600", "--timeout", "50", "--tries", "1", "echo", "x"]), 3)
+    test.assert_eq(smpcli.run(["--serial", "/dev/no-such-port", "echo", "x"]), 3)
+    process.env_set("PATH", old)
+
+    test.case("a pipe to a program that sends back what it is sent, and one that cannot start")
+    test.assert_eq(smpcli.run(["--pipe", "cat", "--timeout", "500", "--tries", "1", "echo", "x"]), 0)
+    test.assert_eq(smpcli.run(["--pipe", "/no/such/relay", "--timeout", "100", "--tries", "1", "echo", "x"]), 3)

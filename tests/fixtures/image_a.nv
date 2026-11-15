@@ -1,0 +1,17 @@
+// image_a: the firmware the host server starts with, in slot A.
+//
+// A board with a [flash] table builds it with `--role=application`, which
+// links it after the NOVB image header and writes the image beside the ELF.
+// It blinks the board's first LED and keeps the watchdog fed.
+
+@tier(embedded)
+fn main() [hw]
+    bsp.board.init()
+    let led = bsp.board.led1()
+    hal.gpio.mode(led, 1)
+    var i = 0
+    while true
+        hal.gpio.set(led, i % 2)
+        hal.watchdog.feed()
+        hal.timer.delay_ms(500)
+        i = i + 1

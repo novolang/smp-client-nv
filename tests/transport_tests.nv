@@ -1,0 +1,128 @@
+// transport_tests: the transports of a host, a packet at a time.
+//
+//   novo test tests/transport_tests.nv
+//
+// `Raw` over a pipe to `cat` gives back the packets it is sent, which is how a packet is shown to cross a pipe whole,
+// with a body that holds zero bytes.  `Framed` is shown against the framing of mcumgr-nv's smpserial.nv.  A serial
+// port is opened with `stty` replaced by a program that succeeds or fails, as a test cannot attach one.
+
+use std.test
+use std.bytes
+use std.fs
+use std.process
+use smphdr
+use smpreq
+use smptransport
+
+fn tmp(name: Str) -> Str
+    "/tmp/smp_client_nv_transport_${process.pid()}_${name}"
+
+// A packet of an echo request, its body `text`.
+fn packet(text: Str) -> Bytes
+    var b: SmpBuf = Vec.new()
+    let n = smpreq.echo(var b, 7, 0, text)
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, b[i] as Int)
+    bytes.from_byte_list(out)
+
+@test
+fn test_a_packet_crosses_a_pipe_whole() [io, fs, mutate]
+    match smptransport.spawn_pipe(["cat"])
+        None    => test.assert(false)
+        Some(t) =>
+            let p = packet("hello")
+            test.assert(t.send(p))
+            match t.recv(2000)
+                None    => test.assert(false)
+                Some(q) => test.assert_eq(bytes.to_hex(q), bytes.to_hex(p))
+
+            test.case("two packets in a row come out one at a time")
+            test.assert(t.send(packet("one") + packet("two")))
+            match t.recv(2000)
+                None    => test.assert(false)
+                Some(q) => test.assert_eq(bytes.to_hex(q), bytes.to_hex(packet("one")))
+            match t.recv(2000)
+                None    => test.assert(false)
+                Some(q) => test.assert_eq(bytes.to_hex(q), bytes.to_hex(packet("two")))
+
+            test.case("no packet comes: the answer is none")
+            match t.recv(50)
+                None    => ()
+                Some(_) => test.assert(false)
+
+            test.case("a packet cut in the middle is none")
+            test.assert(t.send(bytes.slice(packet("cut"), 0, 11)))
+            match t.recv(50)
+                None    => ()
+                Some(_) => test.assert(false)
+            proc.close(t.wire.pid)
+
+@test
+fn test_a_program_that_cannot_start_is_none() [io, fs, mutate]
+    match smptransport.spawn_pipe(["/no/such/relay"])
+        None    => ()
+        Some(t) =>
+            // The child could not exec: nothing arrives.
+            test.assert(not t.send(packet("x")) or t.recv(100) == None)
+            proc.close(t.wire.pid)
+
+@test
+fn test_the_framing_round_trips_a_packet() [io, fs, mutate]
+    let p = packet("framed")
+    let lines = smptransport.frame(p)
+    test.assert(bytes.len(lines) > bytes.len(p))
+    match smptransport.spawn_pipe(["cat"])
+        None    => test.assert(false)
+        Some(raw) =>
+            let t = Framed { wire: raw.wire }
+            test.assert(t.send(p))
+            match t.recv(2000)
+                None    => test.assert(false)
+                Some(q) => test.assert_eq(bytes.to_hex(q), bytes.to_hex(p))
+            proc.close(raw.wire.pid)
+
+    test.case("a packet larger than the buffer is not framed")
+    let big = bytes.zeros(mcumgr_nv.CONFIG.SMP_BUF_BYTES + 1)
+    test.assert_eq(bytes.len(smptransport.frame(big)), 0)
+    match smptransport.spawn_pipe(["cat"])
+        None    => test.assert(false)
+        Some(raw) =>
+            test.assert(not Framed { wire: raw.wire }.send(big))
+            proc.close(raw.wire.pid)
+
+@test
+fn test_a_serial_port_is_opened_only_when_stty_sets_it() [io, fs]
+    let bin = tmp("bin")
+    test.assert(fs.mkdir_all(bin))
+    let old = process.env("PATH") ?? ""
+    process.env_set("PATH", "${bin}:${old}")
+
+    test.case("stty succeeds")
+    test.assert(fs.write("${bin}/stty", "#!/bin/sh\nexit 0\n"))
+    test.assert(fs.set_file_mode("${bin}/stty", 0o755))
+    match smptransport.open_serial("/dev/null", 115200)
+        None    => test.assert(false)
+        Some(t) => test.assert_eq(t.wire.recv(20), 0 - 1)
+
+    test.case("stty refuses the port")
+    test.assert(fs.write("${bin}/stty", "#!/bin/sh\nexit 1\n"))
+    match smptransport.open_serial("/dev/null", 115200)
+        None    => ()
+        Some(_) => test.assert(false)
+
+    test.case("a path that is missing, empty or not plain is not run through a shell")
+    test.assert(fs.write("${bin}/stty", "#!/bin/sh\nexit 0\n"))
+    match smptransport.open_serial("/dev/no-such-port", 115200)
+        None    => ()
+        Some(_) => test.assert(false)
+    match smptransport.open_serial("", 115200)
+        None    => ()
+        Some(_) => test.assert(false)
+    let odd = tmp("odd port; touch x")
+    test.assert(fs.write(odd, ""))
+    match smptransport.open_serial(odd, 115200)
+        None    => ()
+        Some(_) => test.assert(false)
+    let _ = fs.delete(odd)
+    process.env_set("PATH", old)

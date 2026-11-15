@@ -1,0 +1,169 @@
+// volume_tests: the client against a server that holds a novofs volume in its data region.
+//
+//   novo test tests/volume_tests.nv
+//
+// The server is the session of mcumgr-nv with the data region as image 1 and the file group over a volume
+// mounted on that region (smpflash.nv: 64 blocks of 512 bytes in RAM).  A data image is what `novofs-tools mk`
+// writes: the bytes of a volume made on the same geometry, which the tests make with novofs itself.  The client
+// sends it as image 1 and asks about the files of the volume.
+
+use std.test
+use std.bytes
+use std.fs
+use std.process
+use bootram
+use smphdr
+use smpstate
+use smpsess
+use smpboot
+use smpsim
+use smpnvfs
+use smpflash
+use smpclient
+use smpcli
+use smptransport
+use nvfs
+use smpflash.{ RamBlocks }
+
+let TOTAL = 32768
+
+var s   = smpstate.session()
+var ram = bootram.ram_slots(256, 64)
+var vol: Volume<RamBlocks> = nvfs.mount_with(smpflash.ram_blocks(), nvfs.default_config(), true)
+
+fn fresh() [mutate]
+    ram = bootram.ram_slots(256, 64)
+    smpboot.set_policy(256, 1, 1, 0)
+    s = smpstate.session()
+    vol = nvfs.mount_with(smpflash.ram_blocks(), nvfs.default_config(), true)
+    smpnvfs.hold(false)
+
+fn data(n: Int, salt: Int) -> Bytes
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, (i * 5 + salt + (i >> 7)) & 0xFF)
+    bytes.from_byte_list(out)
+
+// The same bytes as a source for a write to the volume.
+fn src(n: Int, salt: Int) -> [u8]
+    var out: [u8] = []
+    for i in 0..n
+        list.push(out, ((i * 5 + salt + (i >> 7)) & 0xFF) as u8)
+    out
+
+// The cells of the device as an image.
+fn cells() -> Bytes [mutate]
+    var out: [Int] = []
+    for i in 0..TOTAL
+        list.push(out, smpflash.peek(i))
+    bytes.from_byte_list(out)
+
+// Whether the cells of the device are the bytes of `img`.
+fn holds(img: Bytes) -> Bool [mutate]
+    for i in 0..bytes.len(img)
+        if smpflash.peek(i) != (bytes.byte_at(img, i) ?? 0 - 1)
+            return false
+    true
+
+// A volume with some files, as an image: the volume is made on a device of its own and unmounted, and the cells are
+// the image.  `files` files of 40 bytes and one of 2,000, which takes data blocks.
+fn make_image(files: Int, salt: Int) -> Bytes [mutate]
+    let v = nvfs.mount_with(smpflash.ram_blocks(), nvfs.default_config(), true)
+    test.assert(v.mkdir("/etc") == EOk)
+    for k in 0..files
+        test.assert(v.file_write("/etc/f${k}", src(40, salt + k)) == EOk)
+    test.assert(v.file_write("/big", src(2000, salt)) == EOk)
+    let _ = v.unmount()
+    cells()
+
+// The files a volume mounted on the device holds, as a string for comparing.
+fn listing() -> Str [mutate]
+    let v = nvfs.mount(smpflash.RamBlocks { id: 0 })
+    if v.status() != EOk
+        return "(${nvfs.err_str(v.status())})"
+    var out = ""
+    let big = v.file_size("/big")
+    out = out + "big=${big}"
+    var k = 0
+    for _i in 0..8
+        let size = v.file_size("/etc/f${k}")
+        if size >= 0
+            out = out + " f${k}=${size}"
+        k = k + 1
+    out
+
+var inbox: [Int] = []
+var at           = 0
+
+@value
+struct SrvPort
+    id: Int
+
+impl SmpPort[mutate] for SrvPort
+    fn take_byte(self) -> Int [mutate]
+        0 - 1
+
+    fn put_byte(self, b: Int) [mutate]
+        list.push(inbox, b)
+
+// A wire to the session of the data region and the volume: what the client sends is fed to the session a byte at a
+// time, as the serial loop of a device does.
+@value
+struct DataLoop
+    id: Int
+
+impl Wire[mutate] for DataLoop
+    fn send(self, data: Bytes) -> Bool [mutate]
+        for i in 0..bytes.len(data)
+            let done = smpsess.feed_with(smpboot.ram_store(ram), smpsim.sim_os(ram), NvfsFiles { vol: vol },
+                                         RamData { id: 0 }, SrvPort { id: 0 }, var s, bytes.byte_at(data, i) ?? 0)
+        true
+
+    fn recv(self, ms: Int) -> Int [mutate]
+        if at < inbox.len()
+            let v = inbox[at]
+            at = at + 1
+            return v
+        0 - 1
+
+fn tmp(name: Str) -> Str
+    "/tmp/smp_client_nv_volume_${process.pid()}_${name}"
+
+@test
+fn test_the_client_sends_a_data_image_and_asks_about_files() [io, fs, net, mutate]
+    let img = make_image(2, 4)
+    fresh()
+    inbox = []
+    at = 0
+    let w = Framed { wire: DataLoop { id: 0 } }
+    test.assert_eq(smpclient.image_upload_to(w, 1, img, 0, 100, 1), 0)
+    test.assert(holds(img))
+    test.assert_eq(listing(), "big=2000 f0=40 f1=40")
+
+    test.case("the status, the checksum and the close of the file group")
+    fresh()
+    let src_file = tmp("src")
+    test.assert(smpcli.write_file(src_file, img))
+    test.assert_eq(smpcli.command_for(w, ["image", "upload", src_file], 1, 100, 1), 0)
+    // The program mounts its volume again, as a device program does in its `remount`.
+    vol = nvfs.mount(smpflash.RamBlocks { id: 0 })
+    test.assert_eq(smpcli.command(w, ["fs", "status", "/big"], 100, 1), 0)
+    test.assert_eq(smpcli.command(w, ["fs", "status", "/absent"], 100, 1), ENOENT)
+    test.assert_eq(smpcli.command(w, ["fs", "hash", "/big"], 100, 1), 0)
+    test.assert_eq(smpcli.command(w, ["fs", "hash", "/absent"], 100, 1), ENOENT)
+    test.assert_eq(smpcli.command(w, ["fs", "close"], 100, 1), 0)
+    test.assert_eq(smpclient.fs_status(w, "/big", 100, 1), 0)
+    test.assert_eq(smpclient.fs_hash(w, "/big", 100, 1), 0)
+    test.assert_eq(smpclient.fs_close(w, 100, 1), 0)
+
+    test.case("an upload of a file and the image flag of the program")
+    let small = tmp("small")
+    test.assert(smpcli.write_file(small, data(300, 1)))
+    test.assert_eq(smpcli.command(w, ["fs", "upload", small, "/etc/new"], 100, 1), 0)
+    test.assert_eq(smpcli.command(w, ["image", "upload", "/no/such/file"], 100, 1), 1)
+    test.assert_eq(smpcli.command_for(w, ["image", "upload", small], 1, 100, 1), EINVAL)
+    let args = ["--image", "1", "image", "upload", "x"]
+    test.assert_eq(smpcli.words(args).len(), 3)
+    let _ = fs.delete(src_file)
+    let _ = fs.delete(small)
+

@@ -1,0 +1,611 @@
+// update_tests: `novo update`, the command line, the board, the listing of ports and the flow of an update.
+//
+//   novo test tests/update_tests.nv
+//
+// The steps run against a server in the same process (a session of mcumgr-nv over RAM slots).  The links run
+// against stand-ins a test makes: a loopback in the framing (a FIFO opened for reading and writing as a serial
+// port, a socket to an echoing program), and a relay that echoes the packets it is given.  An echoed request is
+// an answer the client accepts: it carries the request's sequence number and no error.
+
+use std.test
+use std.bytes
+use std.env
+use std.fs
+use std.net
+use std.process
+use bootram
+use hostimg
+use smphdr
+use smpserial
+use smpstate
+use smpsess
+use smpboot
+use smpsim
+use smpram
+use smppack
+use smptransport
+use update
+
+let CHIP  = 0x413
+let BOARD = 0x96A06A37
+let HB    = 256
+
+var srv          = smpstate.session()
+var ram          = bootram.ram_slots(256, 64)
+var inbox: [Int] = []
+var at           = 0
+
+@value
+struct SrvPort
+    id: Int
+
+impl SmpPort[mutate] for SrvPort
+    fn take_byte(self) -> Int [mutate]
+        0 - 1
+
+    fn put_byte(self, b: Int) [mutate]
+        list.push(inbox, b)
+
+@value
+struct Loop
+    id: Int
+
+impl Wire[mutate] for Loop
+    fn send(self, data: Bytes) -> Bool [mutate]
+        for i in 0..bytes.len(data)
+            let _ = smpsess.feed(smpboot.ram_store(ram), smpsim.sim_os(ram), RamFile { id: 0 }, SrvPort { id: 0 },
+                                 var srv, bytes.byte_at(data, i) ?? 0)
+        true
+
+    fn recv(self, ms: Int) -> Int [mutate]
+        if at < inbox.len()
+            let v = inbox[at]
+            at = at + 1
+            return v
+        0 - 1
+
+fn lp() -> Framed<Loop>
+    Framed { wire: Loop { id: 0 } }
+
+fn fresh() [mutate]
+    ram = bootram.ram_slots(256, 64)
+    smpboot.set_policy(HB, CHIP, BOARD, 0)
+    srv = smpstate.session()
+    inbox = []
+    at = 0
+    let _ = smpram.ram_file()
+
+fn image(version: Int, n: Int, salt: Int) -> Bytes
+    var body: [Int] = []
+    for i in 0..n
+        list.push(body, (i * 11 + salt) & 0xFF)
+    hostimg.image(CHIP, BOARD, HB, version, salt, true, bytes.from_byte_list(body))
+
+fn tmp(name: Str) -> Str
+    "/tmp/smp_client_nv_update_${process.pid()}_${name}"
+
+fn put(file: Str, data: Bytes) [fs]
+    test.assert(smpcli_write(file, data))
+
+fn smpcli_write(file: Str, data: Bytes) -> Bool [fs]
+    var all: [Int] = []
+    for i in 0..bytes.len(data)
+        list.push(all, bytes.byte_at(data, i) ?? 0)
+    match fs.open_write(file)
+        None     => false
+        Some(fd) =>
+            let failed = fs.write_at(fd, 0, all)
+            fs.close(fd)
+            match failed
+                Some(_) => false
+                None    => true
+
+// A program a test names as the toolchain or as the relay: `body` is the shell text after the first line.
+fn script(name: Str, body: Str) -> Str [io, fs]
+    let file = tmp(name)
+    test.assert(fs.write(file, "#!/bin/sh\n${body}\n"))
+    test.assert(fs.set_file_mode(file, 0o755))
+    file
+
+let BOARD_JSON = "{\"board\": \"demo\", \"probe\": [\"1366:1015\"], \"header_bytes\": 256, \"signing\": \"optional\", \"regions\": {\"slot_a\": {\"start\": 4096, \"bytes\": 8192}, \"slot_b\": {\"start\": 12288, \"bytes\": 8192}, \"data\": {\"start\": 28672, \"bytes\": 4096}}}"
+
+@test
+fn test_the_command_line_is_read() [io, fs]
+    let a = update.parse(["--target", "demo", "--serial", "/dev/ttyACM0", "--baud", "9600", "--timeout", "500", "--tries", "2",
+                          "--wait", "9", "--test", "--confirm", "x.img"])
+    test.assert(a.ok)
+    test.assert_eq(a.target, "demo")
+    test.assert_eq(a.link, "serial")
+    test.assert_eq(a.addr, "/dev/ttyACM0")
+    test.assert_eq(a.baud, 9600)
+    test.assert_eq(a.ms, 500)
+    test.assert_eq(a.tries, 2)
+    test.assert_eq(a.wait, 9)
+    test.assert(a.test)
+    test.assert(a.confirm)
+    test.assert_eq(a.words.len(), 1)
+
+    test.case("a flag with no value to find, and the defaults")
+    let b = update.parse(["--serial", "x.img"])
+    test.assert_eq(b.link, "serial")
+    test.assert_eq(b.addr, "")
+    test.assert_eq(b.words[0], "x.img")
+    test.assert_eq(b.baud, 115200)
+    test.assert_eq(b.ms, 10000)
+    test.assert_eq(b.tries, 3)
+    test.assert_eq(b.wait, 30)
+    test.assert(not b.test)
+    let c = update.parse(["--ble", "00:11:22:33:44:AA", "list"])
+    test.assert_eq(c.link, "ble")
+    test.assert_eq(c.addr, "00:11:22:33:44:AA")
+    let d = update.parse(["--ble", "list"])
+    test.assert_eq(d.addr, "")
+    test.assert_eq(d.words[0], "list")
+    let e = update.parse(["--tcp", "h:1", "--target=demo", "list"])
+    test.assert_eq(e.link, "tcp")
+    test.assert_eq(e.addr, "h:1")
+    test.assert_eq(e.target, "demo")
+
+    test.case("the spellings with an equals sign")
+    let f = update.parse(["--serial=/dev/x", "list"])
+    test.assert_eq(f.addr, "/dev/x")
+    let g = update.parse(["--ble=00:11:22:33:44:AA", "--tcp=h:2"])
+    test.assert_eq(g.link, "tcp")
+    test.assert_eq(g.addr, "h:2")
+    let h = update.parse(["--ble=00:11:22:33:44:AA"])
+    test.assert_eq(h.link, "ble")
+    test.assert_eq(h.addr, "00:11:22:33:44:AA")
+
+    test.case("a flag that needs a value and has none, and values that are no numbers")
+    test.assert(not update.parse(["list", "--target"]).ok)
+    test.assert(not update.parse(["--wait"]).ok)
+    let i = update.parse(["--baud", "x", "--timeout", "y", "--tries", "z", "--wait", "w"])
+    test.assert_eq(i.baud, 115200)
+    test.assert_eq(i.ms, 10000)
+    test.assert_eq(i.tries, 3)
+    test.assert_eq(i.wait, 30)
+
+@test
+fn test_a_bluetooth_address_has_six_pairs_of_hexadecimal_digits() [io, fs]
+    test.assert(update.is_address("00:11:22:33:44:AA"))
+    test.assert(update.is_address("ab:cd:ef:01:23:45"))
+    test.assert(not update.is_address("00:11:22:33:44"))
+    test.assert(not update.is_address("00-11-22-33-44-AA"))
+    test.assert(not update.is_address("00:11:22:33:44:AG"))
+    test.assert(not update.is_address("0g:11:22:33:44:AA"))
+
+@test
+fn test_the_board_is_read_from_the_toolchains_json() [io, fs]
+    process.env_set("NOVO_PROBE", "")
+    match update.board_of(BOARD_JSON)
+        None    => test.assert(false)
+        Some(b) =>
+            test.assert_eq(b.name, "demo")
+            test.assert_eq(b.vendor, "1366")
+            test.assert_eq(b.probes.len(), 1)
+            test.assert_eq(b.slot_b, 8192)
+            test.assert_eq(b.data, 4096)
+            test.assert_eq(b.serial, "")
+    match update.board_of("{\"board\": \"bare\", \"probe\": [], \"regions\": {}}")
+        None    => test.assert(false)
+        Some(b) =>
+            test.assert_eq(b.vendor, "")
+            test.assert_eq(b.slot_b, 0)
+            test.assert_eq(b.data, 0)
+    match update.board_of("{\"board\": \"none\"}")
+        None    => test.assert(false)
+        Some(b) => test.assert_eq(b.slot_b, 0)
+    match update.board_of("not json")
+        None    => ()
+        Some(_) => test.assert(false)
+
+    test.case("the serial number of the probe comes from NOVO_PROBE")
+    process.env_set("NOVO_PROBE", "1366:1015:000683644473")
+    match update.board_of(BOARD_JSON)
+        None    => test.assert(false)
+        Some(b) => test.assert_eq(b.serial, "000683644473")
+    process.env_set("NOVO_PROBE", "")
+
+@test
+fn test_the_words_become_steps() [io, fs]
+    let o = update.parse([])
+    test.assert_eq(update.steps_of([], o).len(), 0)
+    for v in ["list", "erase"]
+        let s = update.steps_of([v], o)
+        test.assert_eq(s.len(), 1)
+        test.assert_eq(s[0].words[1], v)
+    test.assert_eq(update.steps_of(["params"], o)[0].words[0], "params")
+    test.assert_eq(update.steps_of(["reset"], o)[0].words[0], "reset")
+    test.assert_eq(update.steps_of(["echo", "hi"], o)[0].words[1], "hi")
+    test.assert_eq(update.steps_of(["echo"], o).len(), 0)
+    test.assert_eq(update.steps_of(["test", "ab"], o)[0].words[2], "ab")
+    test.assert_eq(update.steps_of(["test"], o).len(), 0)
+    test.assert_eq(update.steps_of(["confirm"], o)[0].words.len(), 2)
+    test.assert_eq(update.steps_of(["confirm", "ab"], o)[0].words[2], "ab")
+    let d = update.steps_of(["data", "region.bin"], o)
+    test.assert_eq(d[0].image, 1)
+    test.assert_eq(d[0].words[2], "region.bin")
+    test.assert_eq(update.steps_of(["data"], o).len(), 0)
+    let f = update.steps_of(["file", "up", "a", "/b"], o)
+    test.assert_eq(f[0].words.len(), 4)
+    test.assert_eq(f[0].words[0], "fs")
+    test.assert_eq(f[0].words[1], "upload")
+    test.assert_eq(update.steps_of(["file", "down", "/b", "a"], o)[0].words[1], "download")
+    test.assert_eq(update.steps_of(["file", "status", "/b"], o)[0].words[1], "status")
+    test.assert_eq(update.steps_of(["file", "hash", "up"], o)[0].words[2], "up")
+    test.assert_eq(update.steps_of(["file"], o).len(), 0)
+    let u = update.steps_of(["upload", "x.img"], o)
+    test.assert_eq(u[0].words[1], "upload")
+    test.assert_eq(u[0].image, 0)
+    test.assert_eq(update.steps_of(["x.img"], o)[0].words[2], "x.img")
+    test.assert_eq(update.steps_of(["upload"], o).len(), 0)
+
+@test
+fn test_an_image_that_does_not_fit_is_refused_before_the_link_is_opened() [io, fs]
+    fresh()
+    let b = update.Board { name: "demo", vendor: "", probes: [], serial: "", slot_b: 2000, data: 600 }
+    let big = tmp("big.img")
+    let small = tmp("small.img")
+    let region = tmp("region.bin")
+    put(big, image(0x01000000, 3000, 1))
+    put(small, image(0x01000000, 500, 1))
+    put(region, bytes.zeros(600))
+    let o = update.parse([])
+    test.assert(update.refusal(update.steps_of(["upload", big], o), b) != "")
+    test.assert_eq(update.refusal(update.steps_of(["upload", small], o), b), "")
+    test.assert_eq(update.refusal(update.steps_of(["data", region], o), b), "")
+    put(region, bytes.zeros(601))
+    test.assert(update.refusal(update.steps_of(["data", region], o), b) != "")
+
+    test.case("no board named, a file that cannot be read, a board with no sizes, a verb with no file")
+    let none = update.Board { name: "", vendor: "", probes: [], serial: "", slot_b: 0, data: 0 }
+    test.assert_eq(update.refusal(update.steps_of(["upload", big], o), none), "")
+    test.assert_eq(update.refusal(update.steps_of(["data", region], o), none), "")
+    test.assert(update.refusal(update.steps_of(["upload", "/no/such"], o), b) != "")
+    test.assert(update.refusal(update.steps_of(["upload", "/no/such"], o), none) != "")
+    let empty = update.Board { name: "demo", vendor: "", probes: [], serial: "", slot_b: 0, data: 0 }
+    test.assert_eq(update.refusal(update.steps_of(["upload", big], o), empty), "")
+    test.assert_eq(update.refusal(update.steps_of(["data", region], o), empty), "")
+    test.assert_eq(update.refusal(update.steps_of(["list"], o), b), "")
+    let _ = fs.delete(big)
+    let _ = fs.delete(small)
+    let _ = fs.delete(region)
+
+@test
+fn test_the_hash_of_an_image_is_the_same_in_a_package() [io, fs]
+    let img = image(0x01020003, 700, 3)
+    let h = update.image_hash(img)
+    test.assert_eq(str.len(h), 64)
+    test.assert_eq(update.image_hash(smppack.wrap(img)), h)
+    test.assert_eq(h, bytes.to_hex(bytes.slice(img, 0x20, 0x40)))
+
+@test
+fn test_the_hash_of_a_file_is_empty_when_it_cannot_be_read() [io, fs]
+    let file = tmp("hash.img")
+    let img = image(0x01020003, 300, 2)
+    put(file, img)
+    test.assert_eq(update.file_hash(file), update.image_hash(img))
+    test.assert_eq(update.file_hash("/no/such/file"), "")
+    let _ = fs.delete(file)
+
+@test
+fn test_an_upload_with_test_and_confirm_is_split_at_the_restart() [io, fs]
+    let first = [update.Step { words: ["image", "upload", "x"], image: 0 }]
+    let plain = update.flow(first, "ab", update.parse([]))
+    test.assert_eq(plain.len(), 1)
+    test.assert_eq(plain[0].len(), 1)
+    let nodigest = update.flow(first, "", update.parse(["--test"]))
+    test.assert_eq(nodigest[0].len(), 1)
+    let t = update.flow(first, "ab", update.parse(["--test"]))
+    test.assert_eq(t.len(), 1)
+    test.assert_eq(t[0].len(), 3)
+    test.assert_eq(t[0][1].words[1], "test")
+    test.assert_eq(t[0][2].words[0], "reset")
+    let c = update.flow(first, "ab", update.parse(["--confirm"]))
+    test.assert_eq(c.len(), 1)
+    test.assert_eq(c[0][1].words[1], "confirm")
+    test.assert_eq(c[0][1].words[2], "ab")
+    let both = update.flow(first, "ab", update.parse(["--test", "--confirm"]))
+    test.assert_eq(both.len(), 2)
+    test.assert_eq(both[0][1].words[1], "test")
+    test.assert_eq(both[1][0].words.len(), 2)
+    test.assert_eq(both[1][0].words[1], "confirm")
+
+@test
+fn test_the_serial_ports_of_usb_boards_are_listed() [io, fs]
+    let sys = tmp("sys")
+    let dev = tmp("dev")
+    for n in ["ttyACM0", "ttyACM1", "ttyUSB0", "ttyS0", "ttyACM9"]
+        test.assert(fs.mkdir_all("${sys}/${n}/device"))
+    test.assert(fs.write("${sys}/ttyACM0/idVendor", "1366\n"))
+    test.assert(fs.write("${sys}/ttyACM0/idProduct", "1025\n"))
+    test.assert(fs.write("${sys}/ttyACM0/serial", "000683644473\n"))
+    test.assert(fs.write("${sys}/ttyACM0/product", "J-Link\n"))
+    test.assert(fs.write("${sys}/ttyACM1/idVendor", "0403\n"))
+    test.assert(fs.write("${sys}/ttyUSB0/idVendor", "1366\n"))
+    test.assert(fs.write("${sys}/ttyUSB0/serial", "OTHER\n"))
+    test.assert(fs.write("${sys}/ttyS0/idVendor", "1366\n"))
+    // ttyACM9 has no USB device above it.
+    let all = update.ports(sys, dev)
+    test.assert_eq(all.len(), 3)
+    test.assert_eq(all[0].path, "${dev}/ttyACM0")
+    test.assert_eq(all[0].vid, "1366")
+    test.assert_eq(all[0].product, "J-Link")
+    test.assert_eq(all[1].path, "${dev}/ttyACM1")
+    test.assert_eq(all[2].path, "${dev}/ttyUSB0")
+    test.assert_eq(update.port_line(all[0]), "${dev}/ttyACM0  1366:1025  J-Link  000683644473")
+
+    test.case("the ports of a board: by the probe's serial number, by the vendor, else all")
+    let by_serial = update.Board { name: "d", vendor: "1366", probes: [], serial: "OTHER", slot_b: 0, data: 0 }
+    test.assert_eq(update.ports_of(all, by_serial).len(), 1)
+    test.assert_eq(update.ports_of(all, by_serial)[0].path, "${dev}/ttyUSB0")
+    let by_vendor = update.Board { name: "d", vendor: "1366", probes: [], serial: "", slot_b: 0, data: 0 }
+    test.assert_eq(update.ports_of(all, by_vendor).len(), 2)
+    let other_vendor = update.Board { name: "d", vendor: "9999", probes: [], serial: "nope", slot_b: 0, data: 0 }
+    test.assert_eq(update.ports_of(all, other_vendor).len(), 3)
+    let by_id = update.Board { name: "d", vendor: "1366", probes: ["1366:1025"], serial: "", slot_b: 0, data: 0 }
+    test.assert_eq(update.ports_of(all, by_id).len(), 1)
+    test.assert_eq(update.ports_of(all, by_id)[0].path, "${dev}/ttyACM0")
+    let anyone = update.Board { name: "", vendor: "", probes: [], serial: "", slot_b: 0, data: 0 }
+    test.assert_eq(update.ports_of(all, anyone).len(), 3)
+    test.assert_eq(update.ports("/no/such/dir", dev).len(), 0)
+
+@test
+fn test_the_addresses_of_a_scan_are_taken_from_its_lines() [io, fs]
+    let found = update.addresses_of(["NovoFOTA 00:11:22:33:44:AA -52", "noise", "Other 00:11:22:33:44:BB -70"])
+    test.assert_eq(found.len(), 2)
+    test.assert_eq(found[1], "00:11:22:33:44:BB")
+    test.assert_eq(update.addresses_of([]).len(), 0)
+
+@test
+fn test_steps_run_against_a_server_until_one_fails() [io, fs, mutate]
+    fresh()
+    let img = image(0x01020003, 1500, 5)
+    let file = tmp("run.img")
+    put(file, img)
+    let o = update.parse([])
+    test.assert_eq(update.execute(lp(), update.steps_of(["upload", file], o), 100, 1), 0)
+    test.assert_eq(update.execute(lp(), update.steps_of(["list"], o), 100, 1), 0)
+    let digest = update.image_hash(img)
+    test.assert_eq(update.execute(lp(), update.steps_of(["test", digest], o), 100, 1), 0)
+    test.assert_eq(update.execute(lp(), update.steps_of(["reset"], o), 100, 1), 0)
+    test.assert_eq(update.execute(lp(), update.steps_of(["confirm"], o), 100, 1), 0)
+    test.assert_eq(update.execute(lp(), update.steps_of(["erase"], o), 100, 1), 0)
+
+    test.case("a file goes up, is looked at, and comes back")
+    let local = tmp("local.bin")
+    let back = tmp("back.bin")
+    put(local, image(0x01020003, 100, 9))
+    test.assert_eq(update.execute(lp(), update.steps_of(["file", "up", local, "/f"], o), 100, 1), 0)
+    test.assert_eq(update.execute(lp(), update.steps_of(["file", "status", "/f"], o), 100, 1), 0)
+    test.assert_eq(update.execute(lp(), update.steps_of(["file", "hash", "/f"], o), 100, 1), 0)
+    test.assert_eq(update.execute(lp(), update.steps_of(["file", "down", "/f", back], o), 100, 1), 0)
+    test.assert_eq(bytes.len(fs.read_bytes(back) ?? bytes.zeros(0)), 356)
+    let _ = fs.delete(local)
+    let _ = fs.delete(back)
+
+    test.case("the first step that fails ends the run")
+    let steps = [update.Step { words: ["image", "test", "zz"], image: 0 }, update.Step { words: ["list"], image: 0 }]
+    test.assert_eq(update.execute(lp(), steps, 100, 1), EINVAL)
+    test.assert_eq(update.execute(lp(), [], 100, 1), 0)
+    let _ = fs.delete(file)
+
+@test
+fn test_the_exit_status_of_a_run() [io, fs]
+    test.assert_eq(update.exit_of(0), 0)
+    test.assert_eq(update.exit_of(5), 1)
+    test.assert_eq(update.exit_of(0 - 1), 3)
+    test.assert_eq(update.exit_of(0 - 3), 3)
+    test.assert_eq(update.exit_of(0 - 2), 2)
+
+@test
+fn test_a_command_that_cannot_run_is_a_usage_error_and_says_so() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    let sys = tmp("nosys")
+    let dev = tmp("nodev")
+    test.assert_eq(update.run_in([], sys, dev), 2)
+    test.assert_eq(update.run_in(["list", "--target"], sys, dev), 2)
+    test.assert_eq(update.run_in(["list"], sys, dev), 2)
+    // A word that is no verb is a file.
+    test.assert_eq(update.run_in(["--tcp", "127.0.0.1:1", "frob"], sys, dev), 2)
+    test.assert_eq(update.run_in(["--tcp", "127.0.0.1:1", "echo"], sys, dev), 2)
+
+    test.case("a board the toolchain does not know")
+    process.env_set("NOVO", script("novo_refuses", "exit 1"))
+    test.assert_eq(update.run_in(["--target", "nowhere", "--tcp", "127.0.0.1:1", "list"], sys, dev), 2)
+
+    test.case("an image too large for the board's slot")
+    process.env_set("NOVO", script("novo_demo", "echo '${BOARD_JSON}'"))
+    let big = tmp("toobig.img")
+    put(big, image(0x01000000, 9000, 1))
+    test.assert_eq(update.run_in(["--target", "demo", "--tcp", "127.0.0.1:1", big], sys, dev), 2)
+    let _ = fs.delete(big)
+    process.env_set("NOVO", "")
+
+    test.case("a toolchain path with a space is one word, and a board name that is not plain runs nothing")
+    let spaced = tmp("a toolchain")
+    test.assert(fs.write(spaced, "#!/bin/sh\necho '${BOARD_JSON}'\n"))
+    test.assert(fs.set_file_mode(spaced, 0o755))
+    process.env_set("NOVO", spaced)
+    let canary = tmp("canary")
+    test.assert_eq(update.run_in(["--target", "demo", "--tcp", "127.0.0.1:1", "--timeout", "50", "--tries", "1", "list"], sys, dev), 3)
+    test.assert_eq(update.run_in(["--target", "demo; touch ${canary}", "--tcp", "127.0.0.1:1", "list"], sys, dev), 2)
+    test.assert_eq(update.run_in(["--target=", "--tcp", "127.0.0.1:1", "list"], sys, dev), 3)
+    test.assert(not fs.exists(canary))
+    process.env_set("NOVO", "")
+
+@test
+fn test_the_scan_lists_ports_and_devices() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    process.env_set("NOVO", "")
+    let sys = tmp("scan_sys")
+    let dev = tmp("scan_dev")
+    test.assert_eq(update.run_in(["scan", "--serial"], sys, dev), 3)
+    test.assert(fs.mkdir_all("${sys}/ttyACM0/device"))
+    test.assert(fs.write("${sys}/ttyACM0/idVendor", "1366\n"))
+    test.assert_eq(update.run_in(["scan", "--serial"], sys, dev), 0)
+    test.assert_eq(update.run_in(["scan"], sys, dev), 0)
+
+    test.case("the devices that advertise the service, from the relay")
+    process.env_set("NOVO_UPDATE_BLE", script("relay_scan", "echo 'NovoFOTA 00:11:22:33:44:AA -52'; echo 'NovoFOTA 00:11:22:33:44:BB -60'; echo; echo 'quiet one'"))
+    test.assert_eq(update.run_in(["scan", "--ble"], sys, dev), 0)
+    process.env_set("NOVO_UPDATE_BLE", script("relay_none", "exit 0"))
+    test.assert_eq(update.run_in(["scan", "--ble"], sys, dev), 3)
+    process.env_set("NOVO_UPDATE_BLE", "/no/such/relay")
+    test.assert_eq(update.run_in(["scan", "--ble"], sys, dev), 3)
+    process.env_set("NOVO_UPDATE_BLE", "")
+
+@test
+fn test_a_serial_port_is_found_opened_and_closed() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    process.env_set("NOVO", "")
+    let sys = tmp("ser_sys")
+    let dev = tmp("ser_dev")
+    test.assert(fs.mkdir_all(dev))
+    // A FIFO opened for reading and writing gives back what is written to it: the loopback of a serial port.
+    let fifo = "${dev}/ttyACM0"
+    test.assert_eq(process.exec("mkfifo ${fifo}"), 0)
+    let bin = tmp("bin")
+    test.assert(fs.mkdir_all(bin))
+    test.assert(fs.write("${bin}/stty", "#!/bin/sh\nexit 0\n"))
+    test.assert(fs.set_file_mode("${bin}/stty", 0o755))
+    let old_path = process.env("PATH") ?? ""
+    process.env_set("PATH", "${bin}:${old_path}")
+
+    test.case("no port is attached")
+    test.assert_eq(update.run_in(["--serial", "list"], sys, dev), 3)
+
+    test.case("two ports: the user chooses")
+    for n in ["ttyACM0", "ttyACM1"]
+        test.assert(fs.mkdir_all("${sys}/${n}/device"))
+        test.assert(fs.write("${sys}/${n}/idVendor", "1366\n"))
+    test.assert_eq(update.run_in(["--serial", "list"], sys, dev), 3)
+
+    test.case("one port: it is used")
+    test.assert(fs.delete("${sys}/ttyACM1/idVendor"))
+    test.assert_eq(update.run_in(["--serial", "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
+
+    test.case("a port that cannot be opened")
+    test.assert_eq(update.run_in(["--serial=${dev}/ttyACM7", "list"], sys, dev), 3)
+    process.env_set("PATH", old_path)
+
+@test
+fn test_a_socket_is_reached_and_closed() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    process.env_set("NOVO", "")
+    let sys = tmp("tcp_sys")
+    let dev = tmp("tcp_dev")
+    test.assert_eq(update.run_in(["--tcp", "nowhere", "list"], sys, dev), 3)
+    test.assert_eq(update.run_in(["--tcp", "127.0.0.1:1", "list"], sys, dev), 3)
+
+    test.case("a program that sends back what it is sent")
+    var port = 0
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            port = net.local_port(server)
+            net.close(server)
+    let py = "import socket\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', ${port}))\ns.listen(1)\nc, _ = s.accept()\nwhile True:\n    d = c.recv(4096)\n    if not d:\n        break\n    c.sendall(d)\n"
+    let echo = tmp("echo.py")
+    test.assert(fs.write(echo, py))
+    match proc.spawn(["python3", echo])
+        None      => test.assert(false)
+        Some(pid) =>
+            time.sleep(1.0)
+            test.assert_eq(update.run_in(["--tcp", "127.0.0.1:${port}", "--timeout", "2000", "--tries", "1", "list"], sys, dev), 0)
+            proc.close(pid)
+    let _ = fs.delete(echo)
+
+@test
+fn test_a_relay_carries_the_packets_of_an_update_and_the_restart_is_waited_for() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    process.env_set("NOVO", "")
+    let sys = tmp("ble_sys")
+    let dev = tmp("ble_dev")
+    let addr = "00:11:22:33:44:AA"
+    process.env_set("NOVO_UPDATE_BLE", script("relay_echo", "exec cat"))
+    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
+
+    test.case("a device found by the scan is the one used")
+    process.env_set("NOVO_UPDATE_BLE", script("relay_one", "if [ \"$2\" = scan ]; then echo 'NovoFOTA 00:11:22:33:44:AA -52'; else exec cat; fi"))
+    test.assert_eq(update.run_in(["--ble", "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
+
+    test.case("two devices: the user chooses; none: nothing to update")
+    process.env_set("NOVO_UPDATE_BLE", script("relay_two", "echo 'A 00:11:22:33:44:AA -52'; echo 'B 00:11:22:33:44:BB -60'"))
+    test.assert_eq(update.run_in(["--ble", "list"], sys, dev), 3)
+    process.env_set("NOVO_UPDATE_BLE", script("relay_nobody", "exit 0"))
+    test.assert_eq(update.run_in(["--ble", "list"], sys, dev), 3)
+
+    test.case("an upload, a trial, the restart and the confirmation")
+    process.env_set("NOVO_UPDATE_BLE", script("relay_echo2", "exec cat"))
+    let file = tmp("flow.img")
+    put(file, image(0x01020003, 300, 5))
+    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "--wait", "3", "--test", "--confirm", file], sys, dev), 0)
+    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "--test", file], sys, dev), 0)
+    let _ = fs.delete(file)
+
+    test.case("a board that does not come back")
+    process.env_set("NOVO_UPDATE_BLE", script("relay_once", "if [ -e ${tmp("relay_once.seen")} ]; then exit 0; fi; : > ${tmp("relay_once.seen")}; exec cat"))
+    let again = tmp("again.img")
+    put(again, image(0x01020003, 100, 6))
+    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "300", "--tries", "1", "--wait", "1", "--test", "--confirm", again], sys, dev), 3)
+    let _ = fs.delete(again)
+
+    test.case("a relay that cannot start")
+    process.env_set("NOVO_UPDATE_BLE", "/no/such/relay")
+    test.assert_eq(update.run_in(["--ble", addr, "list"], sys, dev), 3)
+    process.env_set("NOVO_UPDATE_BLE", "")
+
+@test
+fn test_the_relay_is_found_beside_the_toolchain() [io, fs, net, time, mutate]
+    process.env_set("NOVO_UPDATE_BLE", "")
+    let sys = tmp("beside_sys")
+    let dev = tmp("beside_dev")
+    let bin = tmp("beside_bin")
+    test.assert(fs.mkdir_all(bin))
+    test.assert(fs.write("${bin}/novo-update-ble", "#!/bin/sh\nexec cat\n"))
+    test.assert(fs.set_file_mode("${bin}/novo-update-ble", 0o755))
+    process.env_set("NOVO", "${bin}/novo")
+    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
+
+    test.case("without one beside it the name is looked up on PATH, and nothing there is nothing to run")
+    process.env_set("NOVO", "${tmp("elsewhere")}/novo")
+    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev), 3)
+    process.env_set("NOVO", "")
+
+@test
+fn test_the_toolchain_and_the_socket_have_defaults() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    process.env_set("NOVO_UPDATE_BLE", "")
+    let sys = tmp("def_sys")
+    let dev = tmp("def_dev")
+    // No toolchain named and none on PATH: the board cannot be read, which is a usage error.
+    process.env_set("NOVO", "")
+    let old = process.env("PATH") ?? ""
+    let empty = tmp("def_empty")
+    test.assert(fs.mkdir_all(empty))
+    process.env_set("PATH", "${empty}:/usr/bin:/bin")
+    test.assert_eq(update.run_in(["--target", "demo", "--tcp", "127.0.0.1:1", "list"], sys, dev), 2)
+    process.env_set("PATH", old)
+
+    test.case("the relay is told the socket of the bridge")
+    let log = tmp("socket.log")
+    process.env_set("NOVO_HCI_SOCKET", "/tmp/a_bridge.sock")
+    process.env_set("NOVO_UPDATE_BLE", script("relay_socket", "echo \"$1\" >> ${log}; exec cat"))
+    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
+    test.assert(str.contains(fs.read_or(log, ""), "/tmp/a_bridge.sock"))
+    process.env_set("NOVO_HCI_SOCKET", "")
+    process.env_set("NOVO_UPDATE_BLE", "")
+    let _ = fs.delete(log)
+
+@test
+fn test_the_program_reads_the_systems_own_ports() [io, fs, net, time, mutate]
+    test.assert_eq(update.run([]), 2)
+
+@test
+fn test_the_version_is_the_packages() [io, fs, net, time, mutate]
+    test.assert_eq(update.run_in(["--version"], "/none", "/none"), 0)
+    test.assert_eq(update.run_in(["version"], "/none", "/none"), 0)
+    test.assert_eq(update.run_in(["--help"], "/none", "/none"), 0)
+    test.assert_eq(update.run_in(["-h"], "/none", "/none"), 0)
+    test.assert(str.contains(fs.read_or("novo.toml", ""), "version     = \"${update.VERSION}\""))

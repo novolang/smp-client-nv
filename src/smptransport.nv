@@ -1,0 +1,250 @@
+// smptransport: how an SMP packet reaches a server from a host.
+//
+// A `Transport` sends one packet, an SMP header and its body, and receives
+// one.  What differs between the ways to reach a server is how the packet is
+// carried, and the package has two:
+//
+//   Framed   the console framing of the serial transport (smpserial.nv):
+//            base64 lines with a length and a CRC-16.  A serial port, a pty
+//            and a TCP socket carry it; so does the host server of
+//            mcumgr-nv.
+//   Raw      the packet as it is, one after the other.  A reader finds the
+//            end of a packet in its header, whose bytes 2 and 3 hold the
+//            length of the body.  A pipe to a relay carries it; the relay of
+//            noble-examples (pc/ble_smp.nv) is the one that puts the packets
+//            on the SMP service of a device over Bluetooth Low Energy.
+//
+// Both are written over a `Wire`, the bytes of a host: `TcpWire` for a
+// socket, `DevWire` for a descriptor such as a serial port and `PipeWire` for
+// the two ends of a child process.  A program that has another way to carry
+// bytes implements `Wire`; one that has another way to carry packets
+// implements `Transport`.
+//
+// A `recv` that gets no byte within `ms` milliseconds, or whose peer has
+// closed, answers `None`.
+
+use std.bytes
+use std.net
+use std.fs
+use std.process
+use smphdr
+use smpserial
+
+// A host byte transport.  `send` writes all of `data`.  `recv` answers the
+// next byte, 0 to 255, or -1 when none arrives within `ms` milliseconds or
+// the peer has closed.
+pub trait Wire[e]
+    fn send(self, data: Bytes) -> Bool [e]
+    fn recv(self, ms: Int) -> Int [e]
+
+// A host packet transport.  `send` writes one packet, `recv` reads one.
+pub trait Transport[e]
+    fn send(self, packet: Bytes) -> Bool [e, mutate]
+    fn recv(self, ms: Int) -> ?Bytes [e, mutate]
+
+var tcp_in: [Int] = []
+var tcp_at        = 0
+
+// Waits up to `ms` for the socket and reads what it holds into `tcp_in`.
+// Answers whether there is a byte to take.
+@tier(app)
+fn refill(sock: Sock, ms: Int) -> Bool [net, mutate]
+    if not net.fd_wait_readable(sock, ms)
+        return false
+    tcp_in = []
+    tcp_at = 0
+    match net.recv_bytes(sock, 512)
+        None    => ()
+        Some(b) =>
+            for i in 0..bytes.len(b)
+                list.push(tcp_in, bytes.byte_at(b, i) ?? 0)
+    tcp_in.len() > 0
+
+// A connected TCP socket.
+pub struct TcpWire
+    sock: Sock
+
+impl Wire[net, mutate] for TcpWire
+    @tier(app)
+    fn send(self, data: Bytes) -> Bool [net, mutate]
+        net.send_bytes(self.sock, data)
+
+    @tier(app)
+    fn recv(self, ms: Int) -> Int [net, mutate]
+        if tcp_at >= tcp_in.len() and not refill(self.sock, ms)
+            return 0 - 1
+        let v = tcp_in[tcp_at]
+        tcp_at = tcp_at + 1
+        v
+
+// A file descriptor, such as a serial port or the pty of one that has been
+// set to raw mode (`stty raw -echo`, or `socat pty,raw,echo=0`).
+pub @value
+struct DevWire
+    fd: Int
+
+impl Wire[io] for DevWire
+    @tier(app)
+    fn send(self, data: Bytes) -> Bool [io]
+        proc.write(self.fd, bytes.to_str(data)) == bytes.len(data)
+
+    @tier(app)
+    fn recv(self, ms: Int) -> Int [io]
+        if proc.poll(self.fd, ms) == 0
+            return 0 - 1
+        proc.read_byte(self.fd)
+
+// A child process: its standard input is where packets go and its standard
+// output is where they come from.
+pub @value
+struct PipeWire
+    pid: Int
+
+impl Wire[io] for PipeWire
+    @tier(app)
+    fn send(self, data: Bytes) -> Bool [io]
+        proc.write(proc.stdin_fd(self.pid), bytes.to_str(data)) == bytes.len(data)
+
+    @tier(app)
+    fn recv(self, ms: Int) -> Int [io]
+        let fd = proc.stdout_fd(self.pid)
+        if proc.poll(fd, ms) == 0
+            return 0 - 1
+        proc.read_byte(fd)
+
+// The packet in the console framing, as the bytes of its lines.
+var wire_out: [Int] = []
+
+@value
+struct Collector
+    id: Int
+
+impl SmpPort[mutate] for Collector
+    @tier(app)
+    // cov: skip — the collector only writes; `send` never takes a byte from its port
+    fn take_byte(self) -> Int [mutate]
+        0 - 1
+
+    @tier(app)
+    fn put_byte(self, b: Int) [mutate]
+        list.push(wire_out, b)
+
+var out_pkt: SmpBuf = Vec.new()
+var in_pkt: SmpBuf  = Vec.new()
+var in_link         = smpserial.rx_new()
+
+// The console framing of the packet `packet`, or empty when the packet is
+// larger than the buffer of the package's configuration.
+@tier(app)
+pub fn frame(packet: Bytes) -> Bytes [mutate]
+    out_pkt.clear()
+    for i in 0..bytes.len(packet)
+        match out_pkt.push((bytes.byte_at(packet, i) ?? 0) as u8)
+            Ok(_)  => ()
+            Err(_) => return bytes.zeros(0)
+    wire_out = []
+    smpserial.send(Collector { id: 0 }, var out_pkt, out_pkt.len())
+    bytes.from_byte_list(wire_out)
+
+// The console framing over a wire: a serial port, a pty or a TCP socket.
+pub struct Framed<W: Wire[e]>
+    wire: W
+
+impl Transport[e] for Framed
+    @tier(app)
+    fn send(self, packet: Bytes) -> Bool [e, mutate]
+        let lines = frame(packet)
+        if bytes.len(lines) == 0
+            return false
+        in_link = smpserial.rx_new()
+        self.wire.send(lines)
+
+    @tier(app)
+    fn recv(self, ms: Int) -> ?Bytes [e, mutate]
+        for _b in 0..200000
+            let b = self.wire.recv(ms)
+            if b < 0
+                return None
+            let n = smpserial.rx_byte(var in_link, var in_pkt, b)
+            if n > 0
+                var got: [Int] = []
+                for i in 0..n
+                    list.push(got, in_pkt[i] as Int)
+                return Some(bytes.from_byte_list(got))
+        None
+
+// The packet itself over a wire: a pipe to a relay.
+pub struct Raw<W: Wire[e]>
+    wire: W
+
+impl Transport[e] for Raw
+    @tier(app)
+    fn send(self, packet: Bytes) -> Bool [e, mutate]
+        self.wire.send(packet)
+
+    @tier(app)
+    fn recv(self, ms: Int) -> ?Bytes [e, mutate]
+        var got: [Int] = []
+        var want = SMP_HDR_BYTES
+        for _b in 0..SMP_BUF_LIMIT
+            if got.len() >= want
+                break
+            let b = self.wire.recv(ms)
+            if b < 0
+                return None
+            list.push(got, b)
+            if got.len() == SMP_HDR_BYTES
+                want = SMP_HDR_BYTES + (got[2] << 8) + got[3]
+        Some(bytes.from_byte_list(got))
+
+// The most bytes a packet read from a pipe may hold: the largest body a
+// header can state and the header.
+const SMP_BUF_LIMIT = 65535 + 8
+
+// A name a shell passes through unquoted: the characters of a path of a
+// serial device.
+@tier(app)
+fn plain_path(path: Str) -> Bool
+    if str.len(path) == 0
+        return false
+    for i in 0..str.len(path)
+        let c = str.byte_at_or(path, i, 0)
+        let ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')
+                 or c == '/' or c == '_' or c == '.' or c == '-' or c == ':'
+        if not ok
+            return false
+    true
+
+// Connects to `host:port`.
+@tier(app)
+pub fn connect(host: Str, port: Int, ms: Int) -> ?Framed<TcpWire> [net]
+    match net.connect_timeout(host, port, ms)
+        None    => None
+        Some(s) => Some(Framed { wire: TcpWire { sock: s } })
+
+// Opens the descriptor at `path` as it is: a pty already in raw mode, or a
+// file.
+@tier(app)
+pub fn open_dev(path: Str) -> ?Framed<DevWire> [fs]
+    match fs.open_write(path)
+        None     => None
+        Some(fd) => Some(Framed { wire: DevWire { fd: fd } })
+
+// Opens the serial port at `path` at `baud` bits a second, in raw mode with
+// no echo and no flow control, which `stty` sets.  None when the port does
+// not exist, cannot be opened or `stty` refuses it.
+@tier(app)
+pub fn open_serial(path: Str, baud: Int) -> ?Framed<DevWire> [io, fs]
+    if not plain_path(path) or not fs.exists(path)
+        return None
+    match process.run_ok("stty -F ${path} ${baud} raw -echo -echoe -echok -crtscts clocal cread 2>/dev/null")
+        None    => None
+        Some(_) => open_dev(path)
+
+// Starts the program `argv` and talks to it in raw packets through its
+// standard input and output.
+@tier(app)
+pub fn spawn_pipe(argv: [Str]) -> ?Raw<PipeWire> [io]
+    match proc.spawn(argv)
+        None      => None
+        Some(pid) => Some(Raw { wire: PipeWire { pid: pid } })
