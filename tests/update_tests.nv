@@ -133,7 +133,7 @@ fn test_the_command_line_is_read() [io, fs]
     test.assert_eq(b.baud, 115200)
     test.assert_eq(b.ms, 10000)
     test.assert_eq(b.tries, 3)
-    test.assert_eq(b.wait, 30)
+    test.assert_eq(b.wait, 120)
     test.assert(not b.test)
     let c = update.parse(["--ble", "00:11:22:33:44:AA", "list"])
     test.assert_eq(c.link, "ble")
@@ -163,7 +163,7 @@ fn test_the_command_line_is_read() [io, fs]
     test.assert_eq(i.baud, 115200)
     test.assert_eq(i.ms, 10000)
     test.assert_eq(i.tries, 3)
-    test.assert_eq(i.wait, 30)
+    test.assert_eq(i.wait, 120)
 
 @test
 fn test_a_bluetooth_address_has_six_pairs_of_hexadecimal_digits() [io, fs]

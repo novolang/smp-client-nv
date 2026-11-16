@@ -129,7 +129,7 @@ runs; `--confirm` alone makes the staged image permanent.  The verbs are
 region, which is image 1), `list`, `test HASH`, `confirm [HASH]`, `reset`,
 `erase`, `params`, `echo TEXT` and `file up|down|status|hash|close`.  The
 options are `--baud` (115200), `--timeout` (10000 milliseconds), `--tries` (3)
-and `--wait` (30 seconds for the board after a restart).
+and `--wait` (120 seconds for the board after a restart).
 
 With `--target` the program asks the toolchain for the board's flash table
 (`novo bsp flash --target BOARD --json`) and refuses before it opens the link an

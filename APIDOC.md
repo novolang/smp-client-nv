@@ -412,7 +412,7 @@ writes `<name>.img`) or the package `novo image pack` writes.  The VERBs:
 With a FILE or `upload`, --test marks the new image for a trial and resets the board, and --confirm
 waits for the board to answer again and confirms the image that runs; --confirm alone makes the
 staged image permanent and resets.  --baud N (115200), --timeout MS (10000), --tries N (3) and
---wait SECONDS (30, how long to wait for the board after a reset) are the other options.
+--wait SECONDS (120, how long to wait for the board after a reset: the swap of a 340 KB image takes 63 s on the nRF54LM20-DK) are the other options.
 
 The board's [flash] table is read from the toolchain (`novo bsp flash --target BOARD --json`), so
 that this program does not parse the manifest: it tells the size of slot B and of the data region

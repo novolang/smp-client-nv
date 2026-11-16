@@ -22,4 +22,7 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
   of another size than the data region are refused before the link is opened.  `--serial` and `--ble` without an address list the serial ports
   of attached USB boards and the devices that advertise the SMP service, and take the one there is.  `--test` and `--confirm` run the upload,
   the trial, the restart, the wait for the board and the confirmation.
+- The wait for the board after the restart of `--test --confirm` lasts `--wait` seconds (120 by default, 30 first: the swap of a 340 KB image takes 63 s on the
+  nRF54LM20-DK), counted on the clock, and each attempt may take the `--timeout` (10 s; an attempt of one second never saw an answer over Bluetooth, where
+  the scan for the device and the connection come before the first request).
 - Four suites, 42 tests, at 100 % of the lines of `src/` (tests/coverage.sh).

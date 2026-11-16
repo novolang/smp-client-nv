@@ -31,7 +31,7 @@
 // With a FILE or `upload`, --test marks the new image for a trial and resets the board, and --confirm
 // waits for the board to answer again and confirms the image that runs; --confirm alone makes the
 // staged image permanent and resets.  --baud N (115200), --timeout MS (10000), --tries N (3) and
-// --wait SECONDS (30, how long to wait for the board after a reset) are the other options.
+// --wait SECONDS (120, how long to wait for the board after a reset: the swap of a 340 KB image takes 63 s on the nRF54LM20-DK) are the other options.
 //
 // The board's [flash] table is read from the toolchain (`novo bsp flash --target BOARD --json`), so
 // that this program does not parse the manifest: it tells the size of slot B and of the data region
@@ -136,7 +136,7 @@ fn number(s: Str, fallback: Int) -> Int
 // The command line as options.  `ok` is false for a flag that wants a value and has none.
 @tier(app)
 pub fn parse(args: [Str]) -> Opts
-    var o = Opts { ok: true, target: "", link: "", addr: "", baud: 115200, ms: 10000, tries: 3, wait: 30,
+    var o = Opts { ok: true, target: "", link: "", addr: "", baud: 115200, ms: 10000, tries: 3, wait: 120,
                    test: false, confirm: false, words: [] }
     var i = 0
     for _k in 0..args.len() + 1
@@ -175,7 +175,7 @@ pub fn parse(args: [Str]) -> Opts
             else if a == "--tries"
                 o.tries = number(next, 3)
             else
-                o.wait = number(next, 30)
+                o.wait = number(next, 120)
             i = i + 1
         else if str.starts_with(a, "--target=")
             o.target = str.slice(a, 9, str.len(a))
@@ -554,13 +554,18 @@ pub fn flow(first: [Step], digest: Str, o: Opts) -> [[Step]]
         return [one, [Step { words: ["image", "confirm"], image: 0 }]]
     [one]
 
-// Waits for the board to answer a list after a reset, for at most `o.wait` seconds.
+// Waits for the board to answer a list after a reset, for at most `o.wait` seconds.  An attempt may take as long as
+// `o.ms`: over Bluetooth it holds the scan for the device and the connection, a few seconds before the first request goes
+// out, so an attempt of one second never saw an answer.  The seconds are counted on the clock, not by the attempts.
 @tier(app)
 fn wait_for_board(o: Opts, addr: Str) -> Bool [io, fs, net, time, mutate]
+    let t0 = time.ticks_us()
     for _s in 0..o.wait
         time.sleep(1.0)
-        if over_link(o, addr, [Step { words: ["image", "list"], image: 0 }], 1000, 1) == 0
+        if over_link(o, addr, [Step { words: ["image", "list"], image: 0 }], o.ms, 1) == 0
             return true
+        if (time.ticks_us() - t0) / 1000000 >= o.wait
+            return false
     false
 
 // The `scan` verb: the ports or the devices, listed.
