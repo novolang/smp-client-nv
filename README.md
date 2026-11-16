@@ -161,6 +161,7 @@ ADDRESS` after the socket.
    the image's header, which the package's trailer repeats.
 4. **`--serial` sets the port with `stty`.**  A port that `stty` cannot set, or
    a path that is not a plain path, is not opened.  `--dev` does not run `stty`.
+   A frame goes to the port in writes of at most 64 bytes, as the J-Link serial port of the nRF52840-DK drops a longer one.
 5. **A board restarted by the update leaves the link.**  The program closes the
    link and opens it again until the board answers, so a serial port that
    disappears for a moment, or a Bluetooth connection, does not end the run.
@@ -198,7 +199,7 @@ bash tests/coverage.sh
 
 ```bash
 novo test tests/client_tests.nv     # 16: the commands against a server in the same process, a socket, a pipe, a descriptor, a serial port
-novo test tests/transport_tests.nv  #  4: a packet across a pipe, the framing, the opening of a serial port
+novo test tests/transport_tests.nv  #  4: a packet across a pipe, the framing and the pieces of a write, the opening of a serial port
 novo test tests/update_tests.nv     # 21: the command line, the board, the listing, the flow of an update
 novo test tests/volume_tests.nv     #  1: a data image into the data region and the files of its volume
 ```

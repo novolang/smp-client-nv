@@ -268,6 +268,21 @@ Effects: `[net, mutate]`.
 
 Effects: `[net, mutate]`.
 
+### `trait Sink[e]`
+
+Where `write_pieces` puts a piece: a descriptor, or a double that records each piece.  `put` answers whether all of `data` was written.
+
+#### `fn put(self, data: Bytes) -> Bool [e]`
+
+Effects: `[e]`.
+
+### `fn write_pieces<S: Sink[e]>(sink: S, data: Bytes, size: Int) -> Bool [e]`
+
+Effects: `[e]`.
+
+Writes `data` to `sink` in pieces of at most `size` bytes, each a `put` of its own and none after the first one that fails.  Answers whether
+every piece was written.  `size` is at least 1.
+
 ### `struct DevWire`
 
 A file descriptor, such as a serial port or the pty of one that has been

@@ -67,8 +67,26 @@ fn test_a_program_that_cannot_start_is_none() [io, fs, mutate]
             test.assert(not t.send(packet("x")) or t.recv(100) == None)
             proc.close(t.wire.pid)
 
+// The length of each piece a `write_pieces` handed to its sink, and how many pieces to take before one fails (0 = never).
+var piece_lens: [Int] = []
+var fail_after        = 0
+
+@value
+struct Recorder
+    id: Int
+
+impl Sink[mutate] for Recorder
+    @tier(app)
+    fn put(self, data: Bytes) -> Bool [mutate]
+        list.push(piece_lens, bytes.len(data))
+        not (fail_after > 0 and piece_lens.len() >= fail_after)
+
+fn pieces_of(n: Int, size: Int) -> Bool [mutate]
+    piece_lens = []
+    smptransport.write_pieces(Recorder { id: 0 }, bytes.zeros(n), size)
+
 @test
-fn test_the_framing_round_trips_a_packet() [io, fs, mutate]
+fn test_the_framing_round_trips_a_packet_and_is_written_in_pieces() [io, fs, mutate]
     let p = packet("framed")
     let lines = smptransport.frame(p)
     test.assert(bytes.len(lines) > bytes.len(p))
@@ -90,6 +108,60 @@ fn test_the_framing_round_trips_a_packet() [io, fs, mutate]
         Some(raw) =>
             test.assert(not Framed { wire: raw.wire }.send(big))
             proc.close(raw.wire.pid)
+
+    test.case("a frame of 300 bytes is five writes, none of more than 64 bytes")
+    fail_after = 0
+    test.assert(pieces_of(300, 64))
+    test.assert_eq(piece_lens.len(), 5)
+    test.assert_eq(piece_lens[0], 64)
+    test.assert_eq(piece_lens[3], 64)
+    test.assert_eq(piece_lens[4], 44)
+
+    test.case("a frame of 64 bytes is one write")
+    test.assert(pieces_of(64, 64))
+    test.assert_eq(piece_lens.len(), 1)
+    test.assert_eq(piece_lens[0], 64)
+
+    test.case("a frame of 65 bytes is two writes, 64 and 1")
+    test.assert(pieces_of(65, 64))
+    test.assert_eq(piece_lens.len(), 2)
+    test.assert_eq(piece_lens[1], 1)
+
+    test.case("a frame of 128 bytes is two full writes and no empty third")
+    test.assert(pieces_of(128, 64))
+    test.assert_eq(piece_lens.len(), 2)
+
+    test.case("a frame of no bytes is no write")
+    test.assert(pieces_of(0, 64))
+    test.assert_eq(piece_lens.len(), 0)
+
+    test.case("a piece that is not written ends the frame")
+    fail_after = 2
+    test.assert(not pieces_of(300, 64))
+    test.assert_eq(piece_lens.len(), 2)
+    fail_after = 0
+
+    test.case("DevWire.send reaches a descriptor with every byte, in order")
+    let file = tmp("pieces")
+    match fs.open_write(file)
+        None     => test.assert(false)
+        Some(fd) =>
+            let long = packet("a request that is long enough to be cut into several pieces of a port, ${bytes.to_hex(bytes.zeros(80))}")
+            let cut = smptransport.frame(long)
+            test.assert(bytes.len(cut) > 64)
+            test.assert(DevWire { fd: fd }.send(cut))
+            proc.close(fd)
+            match fs.read(file)
+                None    => test.assert(false)
+                Some(t) => test.assert_eq(t, bytes.to_str(cut))
+    let _ = fs.delete(file)
+
+    test.case("DevWire.send on a descriptor that cannot be written is false")
+    match fs.open_write("/dev/full")
+        None     => ()
+        Some(fd) =>
+            test.assert(not DevWire { fd: fd }.send(bytes.zeros(10)))
+            proc.close(fd)
 
 @test
 fn test_a_serial_port_is_opened_only_when_stty_sets_it() [io, fs]

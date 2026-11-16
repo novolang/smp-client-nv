@@ -77,6 +77,40 @@ impl Wire[net, mutate] for TcpWire
         tcp_at = tcp_at + 1
         v
 
+// The most bytes `DevWire.send` hands to one `write`.  The nRF52840-DK's J-Link serial port drops a write of more than one full-speed USB bulk
+// packet, which is 64 bytes, and a second such write takes the probe off the USB bus (bugs/embedded-runtime/
+// a-write-of-more-than-64-bytes-to-the-nrf52840-dks-vcom-gets-no-answer-and-the-next-takes-the-probe-off-usb.md); writes of 64 bytes or fewer, back
+// to back, all arrive.  The pieces are bytes of one frame, and the reader of a frame, `smpserial.rx_byte` of mcumgr-nv, takes a byte at a time
+// and finds a line by its prefix and its newline, so where a write ends is not seen.
+const PIECE_BYTES = 64
+
+// Where `write_pieces` puts a piece: a descriptor, or a double that records each piece.  `put` answers whether all of `data` was written.
+pub trait Sink[e]
+    fn put(self, data: Bytes) -> Bool [e]
+
+struct FdSink
+    fd: Int
+
+impl Sink[io] for FdSink
+    @tier(app)
+    fn put(self, data: Bytes) -> Bool [io]
+        proc.write(self.fd, bytes.to_str(data)) == bytes.len(data)
+
+// Writes `data` to `sink` in pieces of at most `size` bytes, each a `put` of its own and none after the first one that fails.  Answers whether
+// every piece was written.  `size` is at least 1.
+@tier(app)
+pub fn write_pieces<S: Sink[e]>(sink: S, data: Bytes, size: Int) -> Bool [e]
+    let n = bytes.len(data)
+    var at = 0
+    for _p in 0..n / size + 1
+        if at >= n
+            break
+        let end = if at + size < n then at + size else n
+        if not sink.put(bytes.slice(data, at, end))
+            return false
+        at = end
+    true
+
 // A file descriptor, such as a serial port or the pty of one that has been
 // set to raw mode (`stty raw -echo`, or `socat pty,raw,echo=0`).
 pub @value
@@ -86,7 +120,7 @@ struct DevWire
 impl Wire[io] for DevWire
     @tier(app)
     fn send(self, data: Bytes) -> Bool [io]
-        proc.write(self.fd, bytes.to_str(data)) == bytes.len(data)
+        write_pieces(FdSink { fd: self.fd }, data, PIECE_BYTES)
 
     @tier(app)
     fn recv(self, ms: Int) -> Int [io]

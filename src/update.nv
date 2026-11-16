@@ -566,6 +566,7 @@ fn wait_for_board(o: Opts, addr: Str) -> Bool [io, fs, net, time, mutate]
             return true
         if (time.ticks_us() - t0) / 1000000 >= o.wait
             return false
+    // cov: skip — each pass sleeps one second, so the clock check above ends the wait on the pass that reaches `o.wait` seconds, before the loop runs out
     false
 
 // The `scan` verb: the ports or the devices, listed.

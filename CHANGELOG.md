@@ -25,4 +25,9 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 - The wait for the board after the restart of `--test --confirm` lasts `--wait` seconds (120 by default, 30 first: the swap of a 340 KB image takes 63 s on the
   nRF54LM20-DK), counted on the clock, and each attempt may take the `--timeout` (10 s; an attempt of one second never saw an answer over Bluetooth, where
   the scan for the device and the connection come before the first request).
+- `DevWire.send` writes a frame to its descriptor in pieces of at most 64 bytes, each a `write` of its own with no pause between them.  The
+  nRF52840-DK's J-Link serial port drops a single write of more than one full-speed USB bulk packet, so every request longer than 64 bytes got no
+  answer there (bugs/embedded-runtime/a-write-of-more-than-64-bytes-to-the-nrf52840-dks-vcom-gets-no-answer-and-the-next-takes-the-probe-off-usb.md).
+  The pieces are bytes of one frame and the console framing is unchanged.  `write_pieces` and the `Sink` trait it writes to are public, so a test
+  can record each piece.
 - Four suites, 42 tests, at 100 % of the lines of `src/` (tests/coverage.sh).
