@@ -186,8 +186,7 @@ ADDRESS` after the socket.
 
 ## Development
 
-The package depends on mcumgr-nv by a path (`../mcumgr-nv`) until mcumgr-nv 0.2.0
-is published.
+The package depends on mcumgr-nv by the registry range `^0.2.0`, the published 0.2.0.
 
 ```bash
 novo pkg build                                    # the smp-client-nv command
