@@ -28,5 +28,4 @@ path = "src/update_main.nv"
 
 [dependencies]
 # The protocol: the header, the CBOR of a body, the console framing and the request builders, and the server the suites run the client against.
-# A path until mcumgr-nv 0.2.0 is published (PATH-DEPENDENCIES.md of the satellites folder); the range it becomes is `^0.2.0`.
-mcumgr-nv = { path = "../mcumgr-nv" }
+mcumgr-nv = "^0.2.0"
