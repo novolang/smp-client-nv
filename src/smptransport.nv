@@ -11,7 +11,7 @@
 //   Raw      the packet as it is, one after the other.  A reader finds the
 //            end of a packet in its header, whose bytes 2 and 3 hold the
 //            length of the body.  A pipe to a relay carries it; the relay of
-//            noble-examples (pc/ble_smp.nv) is the one that puts the packets
+//            noble-examples (its program ble_smp) is the one that puts the packets
 //            on the SMP service of a device over Bluetooth Low Energy.
 //
 // Both are written over a `Wire`, the bytes of a host: `TcpWire` for a
@@ -37,10 +37,16 @@ pub trait Wire[e]
     fn send(self, data: Bytes) -> Bool [e]
     fn recv(self, ms: Int) -> Int [e]
 
-// A host packet transport.  `send` writes one packet, `recv` reads one.
+// A host packet transport.  `send` writes one packet and answers whether it was written.  `recv` answers the next packet, or None
+// when none arrives within `ms` milliseconds or the link has closed.  `mtu` is the most bytes of one packet the transport carries,
+// the header included, or 0 when the transport sets no limit of its own, which the default body answers: the client sizes the chunk of an upload by it and by the
+// buffer of the package's configuration, whichever is smaller.  A transport whose state changes with a packet keeps it in a field
+// declared `var`, since a struct is a reference and `self` is passed by value.
 pub trait Transport[e]
     fn send(self, packet: Bytes) -> Bool [e, mutate]
     fn recv(self, ms: Int) -> ?Bytes [e, mutate]
+    fn mtu(self) -> Int
+        0
 
 var tcp_in: [Int] = []
 var tcp_at        = 0
@@ -78,8 +84,8 @@ impl Wire[net, mutate] for TcpWire
         v
 
 // The most bytes `DevWire.send` hands to one `write`.  The nRF52840-DK's J-Link serial port drops a write of more than one full-speed USB bulk
-// packet, which is 64 bytes, and a second such write takes the probe off the USB bus (bugs/embedded-runtime/
-// a-write-of-more-than-64-bytes-to-the-nrf52840-dks-vcom-gets-no-answer-and-the-next-takes-the-probe-off-usb.md); writes of 64 bytes or fewer, back
+// packet, which is 64 bytes, and a second such write takes the probe off the USB bus (a bug the
+// novo-lang tracker holds for the board); writes of 64 bytes or fewer, back
 // to back, all arrive.  The pieces are bytes of one frame, and the reader of a frame, `smpserial.rx_byte` of mcumgr-nv, takes a byte at a time
 // and finds a line by its prefix and its newline, so where a write ends is not seen.
 const PIECE_BYTES = 64

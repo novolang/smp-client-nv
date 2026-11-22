@@ -1,0 +1,910 @@
+// api_tests: the library of smpapi.nv, against a script and against the server of mcumgr-nv in the same process.
+//
+//   novo test tests/api_tests.nv
+//
+// The first half runs the commands over a `Scripted` transport (smpscript.nv): canned responses, in the order the device would
+// send them, for the error paths: a code, a lost answer, an answer of another request, a cut packet, a link that refuses a write,
+// a hash that differs, a server that asks for an offset past the file.  The second half runs them against a session of the
+// server, the device side of the tree, which a `Loop` wire feeds a byte at a time: an image goes up, is listed, tested and
+// confirmed, a cut upload resumes at the offset the server kept, and a file goes up and comes back.
+
+use std.test
+use std.bytes
+use bootram
+use hostimg
+use smphdr
+use smpcbor
+use smpserial
+use smprsp
+use smpstate
+use smpsess
+use smpboot
+use smpsim
+use smpram
+use smppack
+use smpapi
+use smpbody
+use smpscript
+use smptransport
+
+let CHIP  = 0x413
+let BOARD = 0x96A06A37
+let HB    = 256
+
+// ── Canned responses ────────────────────────────────────────────────────
+
+var cb: SmpBuf = Vec.new()
+
+// Starts a response of the group and command, with the sequence number `seq`.
+fn start(group: Int, id: Int, seq: Int) [mutate]
+    smprsp.begin(var cb, smphdr.hdr(OP_READ, 0, 0, group, seq, id))
+
+fn done() -> Bytes [mutate]
+    let n = smprsp.finish(var cb)
+    smpscript.packet_of(var cb, n)
+
+fn put_hash(key: Str, fill: Int) [mutate]
+    smpcbor.put_text(var cb, key)
+    smpcbor.put_head(var cb, MAJOR_BYTES, 32)
+    for _i in 0..32
+        let _ = cb.push(fill as u8)
+
+// A response with the code `rc`.
+fn rc_pkt(rc: Int) -> Bytes [mutate]
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_uint(var cb, "rc", rc)
+    done()
+
+// A response with an empty map.
+fn empty_pkt() -> Bytes [mutate]
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 0)
+    done()
+
+// A response whose map holds the unsigned numbers `a` under "off" and `b` under "len".
+fn off_pkt(off: Int, len: Int) -> Bytes [mutate]
+    start(1, 1, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 2)
+    smpcbor.put_uint(var cb, "off", off)
+    smpcbor.put_uint(var cb, "len", len)
+    done()
+
+// A response to a file download: the length of the file and a chunk of it.
+fn data_pkt(len: Int, chunk: Int) -> Bytes [mutate]
+    start(8, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 2)
+    smpcbor.put_uint(var cb, "len", len)
+    smpcbor.put_text(var cb, "data")
+    smpcbor.put_head(var cb, MAJOR_BYTES, chunk)
+    for i in 0..chunk
+        let _ = cb.push(((i * 7) & 0xFF) as u8)
+    done()
+
+// The list of an image whose hash is 32 bytes of `fill`, and one more when `second` is not negative.
+fn list_pkt(fill: Int, second: Int) -> Bytes [mutate]
+    start(1, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_text(var cb, "images")
+    var n = 1
+    if second >= 0
+        n = 2
+    smpcbor.put_head(var cb, MAJOR_ARRAY, n)
+    smpcbor.put_head(var cb, MAJOR_MAP, 6)
+    smpcbor.put_uint(var cb, "image", 0)
+    smpcbor.put_uint(var cb, "slot", 0)
+    smpcbor.put_str(var cb, "version", "1.2.3")
+    put_hash("hash", fill)
+    smpcbor.put_bool(var cb, "bootable", true)
+    smpcbor.put_bool(var cb, "active", true)
+    if second >= 0
+        smpcbor.put_head(var cb, MAJOR_MAP, 5)
+        smpcbor.put_uint(var cb, "image", 0)
+        smpcbor.put_uint(var cb, "slot", 1)
+        smpcbor.put_str(var cb, "version", "2.0.0")
+        put_hash("hash", second)
+        smpcbor.put_bool(var cb, "pending", true)
+    done()
+
+// The list of an array that promises two maps and holds one.
+fn cut_list_pkt() -> Bytes [mutate]
+    start(1, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_text(var cb, "images")
+    smpcbor.put_head(var cb, MAJOR_ARRAY, 2)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_uint(var cb, "image", 0)
+    done()
+
+// A response for the sequence number `seq`, which answers nothing the client asked.
+fn stale_pkt(seq: Int) -> Bytes [mutate]
+    start(0, 0, seq)
+    smpcbor.put_head(var cb, MAJOR_MAP, 0)
+    done()
+
+// A packet whose header states a body of 40 bytes and which holds 4.
+fn short_pkt() -> Bytes [mutate]
+    let whole = rc_pkt(0)
+    var out: [Int] = []
+    for i in 0..8
+        list.push(out, bytes.byte_at(whole, i) ?? 0)
+    out[2] = 0
+    out[3] = 40
+    for i in 0..4
+        list.push(out, 0xA0)
+    bytes.from_byte_list(out)
+
+// A file that looks like a NOVB image of `n` bytes whose hash field is 32 bytes of `fill`.
+fn fake_image(n: Int, fill: Int) -> Bytes
+    var out: [Int] = []
+    for i in 0..n
+        if i == 0
+            list.push(out, 'N')
+        else if i == 1
+            list.push(out, 'O')
+        else if i == 2
+            list.push(out, 'V')
+        else if i == 3
+            list.push(out, 'B')
+        else if i >= 0x20 and i < 0x40
+            list.push(out, fill)
+        else
+            list.push(out, i & 0xFF)
+    bytes.from_byte_list(out)
+
+fn payload(n: Int, salt: Int) -> Bytes
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, (i * 11 + salt) & 0xFF)
+    bytes.from_byte_list(out)
+
+fn opt() -> CallOptions
+    smpapi.options(50, 2)
+
+// ── What the progress callbacks record ──────────────────────────────────
+
+var seen_steps  = 0
+var seen_done   = 0
+var seen_total  = 0
+var stop_after  = 0
+var drop_at     = 0
+
+@value
+struct Count
+    id: Int
+
+impl Progress[mutate] for Count
+    fn step(self, done: Int, total: Int) -> Bool [mutate]
+        seen_steps = seen_steps + 1
+        seen_done = done
+        seen_total = total
+        if drop_at > 0 and seen_steps == drop_at
+            drop = 1
+        stop_after == 0 or seen_steps < stop_after
+
+fn reset_count(stop: Int) [mutate]
+    seen_steps = 0
+    seen_done = 0
+    seen_total = 0
+    stop_after = stop
+    drop_at = 0
+
+// The code of a failed result, 0 for a result that is ok.
+fn code_of<T>(r: Result<T, SmpError>) -> Int
+    match r
+        Ok(_)  => 0
+        Err(e) => e.code
+
+// ── The script ──────────────────────────────────────────────────────────
+
+@test
+fn test_the_commands_of_the_os_group_are_read_from_their_answers() [mutate]
+    let dev = smpscript.scripted()
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_str(var cb, "r", "pong")
+    dev.answer(done())
+    match smpapi.echo(dev, "ping", opt())
+        Ok(s)  => test.assert_eq(s, "pong")
+        Err(_) => test.assert(false)
+
+    test.case("the parameters")
+    start(0, 6, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 2)
+    smpcbor.put_uint(var cb, "buf_size", 512)
+    smpcbor.put_uint(var cb, "buf_count", 3)
+    dev.answer(done())
+    match smpapi.params(dev, opt())
+        Ok(p)  =>
+            test.assert_eq(p.buf_size, 512)
+            test.assert_eq(p.buf_count, 3)
+        Err(_) => test.assert(false)
+
+    test.case("a reset and an erase that the server accepts")
+    dev.answer(empty_pkt())
+    test.assert_eq(code_of(smpapi.reset(dev, opt())), 0)
+    dev.answer(empty_pkt())
+    test.assert_eq(code_of(smpapi.image_erase(dev, opt())), 0)
+    test.assert_eq(dev.requests(), 4)
+    test.assert_eq(dev.pending(), 0)
+
+    test.case("each request names its group, its operation and its command")
+    let echo_req = dev.request(0)
+    test.assert_eq(bytes.byte_at(echo_req, 0) ?? 0 - 1, OP_WRITE)
+    test.assert_eq(bytes.byte_at(echo_req, 5) ?? 0 - 1, GROUP_OS)
+    let image_req = dev.request(3)
+    test.assert_eq(bytes.byte_at(image_req, 5) ?? 0 - 1, GROUP_IMAGE)
+    test.assert_eq(bytes.byte_at(image_req, 7) ?? 0 - 1, 5)
+
+@test
+fn test_the_image_list_is_read_into_slots() [mutate]
+    let dev = smpscript.scripted()
+    dev.answer(list_pkt(0xAB, 0xCD))
+    match smpapi.image_list(dev, opt())
+        Err(_)    => test.assert(false)
+        Ok(slots) =>
+            test.assert_eq(slots.len(), 2)
+            test.assert_eq(slots[0].slot, 0)
+            test.assert_eq(slots[0].version, "1.2.3")
+            test.assert(slots[0].bootable and slots[0].active)
+            test.assert(not slots[0].confirmed and not slots[0].pending and not slots[0].permanent)
+            test.assert_eq(bytes.len(slots[0].hash), 32)
+            test.assert_eq(bytes.byte_at(slots[0].hash, 31) ?? 0 - 1, 0xAB)
+            test.assert_eq(slots[1].slot, 1)
+            test.assert_eq(slots[1].version, "2.0.0")
+            test.assert(slots[1].pending)
+            test.assert_eq(bytes.byte_at(slots[1].hash, 0) ?? 0 - 1, 0xCD)
+
+    test.case("a test and a confirm answer the list the server then holds")
+    dev.answer(list_pkt(0xAB, 0xCD))
+    test.assert_eq(code_of(smpapi.image_test(dev, bytes.zeros(32), opt())), 0)
+    dev.answer(list_pkt(0xAB, 0xCD))
+    test.assert_eq(code_of(smpapi.image_confirm(dev, bytes.zeros(0), opt())), 0)
+
+    test.case("a code of the server in the answer to a test and to a confirm")
+    dev.answer(rc_pkt(EBUSY))
+    test.assert_eq(code_of(smpapi.image_test(dev, bytes.zeros(32), opt())), EBUSY)
+    dev.answer(rc_pkt(ENOENT))
+    test.assert_eq(code_of(smpapi.image_confirm(dev, bytes.zeros(0), opt())), ENOENT)
+
+    test.case("an answer with no images is an empty list, an array that is cut or a key of another type is a bad answer")
+    dev.answer(empty_pkt())
+    match smpapi.image_list(dev, opt())
+        Ok(slots) => test.assert_eq(slots.len(), 0)
+        Err(_)    => test.assert(false)
+    dev.answer(cut_list_pkt())
+    test.assert_eq(code_of(smpapi.image_list(dev, smpapi.options(50, 1))), E_BAD_ANSWER)
+    start(1, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_uint(var cb, "images", 3)
+    dev.answer(done())
+    test.assert_eq(code_of(smpapi.image_list(dev, opt())), E_BAD_ANSWER)
+
+@test
+fn test_a_code_of_the_server_is_the_error() [mutate]
+    let dev = smpscript.scripted()
+    dev.answer(rc_pkt(EBADSTATE))
+    test.assert_eq(code_of(smpapi.image_erase(dev, opt())), EBADSTATE)
+    dev.answer(rc_pkt(ENOTSUP))
+    match smpapi.echo(dev, "x", opt())
+        Ok(_)  => test.assert(false)
+        Err(e) =>
+            test.assert_eq(e.code, ENOTSUP)
+            test.assert_eq(e.message(), "the server answered code 8 (not supported)")
+
+    test.case("the code of the group's error inside the map err")
+    start(1, 5, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_text(var cb, "err")
+    smpcbor.put_head(var cb, MAJOR_MAP, 2)
+    smpcbor.put_uint(var cb, "group", 1)
+    smpcbor.put_uint(var cb, "rc", EBUSY)
+    dev.answer(done())
+    test.assert_eq(code_of(smpapi.image_erase(dev, opt())), EBUSY)
+
+    test.case("the names of the codes and the sentences of the client's own")
+    for c in 1..12
+        test.assert(smpapi.code_name(c) != "")
+    test.assert_eq(smpapi.code_name(99), "code of the server")
+    test.assert_eq(SmpError { code: E_NO_ANSWER }.message(), "the server gave no answer")
+    test.assert_eq(SmpError { code: E_SEND }.message(), "the transport could not send the request")
+    test.assert_eq(SmpError { code: E_BAD_ANSWER }.message(), "the server's answer is malformed")
+    test.assert_eq(SmpError { code: E_HASH }.message(), "the server holds no image with the hash of the uploaded file")
+    test.assert_eq(SmpError { code: E_CANCELLED }.message(), "the transfer was stopped")
+
+@test
+fn test_a_request_that_is_not_answered_is_sent_again_and_then_given_up() [mutate]
+    let dev = smpscript.scripted()
+    test.case("a silence and then an answer: the second try is answered")
+    dev.silence()
+    dev.answer(empty_pkt())
+    test.assert_eq(code_of(smpapi.reset(dev, smpapi.options(50, 2))), 0)
+    test.assert_eq(dev.requests(), 2)
+
+    test.case("a script with nothing in it is a timeout, after every try")
+    test.assert_eq(code_of(smpapi.reset(dev, smpapi.options(50, 3))), E_NO_ANSWER)
+    test.assert_eq(dev.requests(), 5)
+
+    test.case("a link that refuses the write is its own error")
+    dev.refuse_sends(1)
+    test.assert_eq(code_of(smpapi.reset(dev, opt())), E_SEND)
+    test.assert_eq(dev.requests(), 5)
+
+@test
+fn test_an_answer_of_another_request_is_passed_over() [mutate]
+    let dev = smpscript.scripted()
+    dev.answer(empty_pkt())
+    test.assert_eq(code_of(smpapi.reset(dev, opt())), 0)
+    // The number of the request just answered is the one a late copy of its answer carries.
+    let old = smpbody.seq_of(dev.request(0))
+
+    test.case("a late copy of an earlier answer, then the real one")
+    dev.answer_raw(stale_pkt(old))
+    dev.answer(rc_pkt(0))
+    test.assert_eq(code_of(smpapi.reset(dev, opt())), 0)
+
+    test.case("only the late copy: the request is not answered")
+    dev.answer_raw(stale_pkt(smpbody.seq_of(dev.request(1)) + 40))
+    test.assert_eq(code_of(smpapi.reset(dev, smpapi.options(50, 1))), E_NO_ANSWER)
+
+@test
+fn test_a_packet_that_is_cut_is_not_an_answer() [mutate]
+    let dev = smpscript.scripted()
+    test.case("a header that states more than the packet holds, with the right number")
+    dev.answer(short_pkt())
+    test.assert_eq(code_of(smpapi.reset(dev, smpapi.options(50, 1))), E_BAD_ANSWER)
+
+    test.case("the same, once, and then the answer: the request is sent again and answered")
+    dev.answer(short_pkt())
+    dev.answer(empty_pkt())
+    test.assert_eq(code_of(smpapi.reset(dev, smpapi.options(50, 2))), 0)
+
+    test.case("fewer bytes than a header carries no number: it is passed over")
+    dev.answer_raw(bytes.from_byte_list([3, 0, 0]))
+    test.assert_eq(code_of(smpapi.reset(dev, smpapi.options(50, 1))), E_NO_ANSWER)
+
+    test.case("a body that is not a map, and a map that is cut")
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_UINT, 5)
+    dev.answer(done())
+    test.assert_eq(code_of(smpapi.reset(dev, smpapi.options(50, 1))), E_BAD_ANSWER)
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 3)
+    smpcbor.put_uint(var cb, "rc", 0)
+    dev.answer(done())
+    test.assert_eq(code_of(smpapi.reset(dev, smpapi.options(50, 1))), E_BAD_ANSWER)
+
+@test
+fn test_a_response_of_any_shape_the_protocol_allows_is_read() [mutate]
+    // The body is a map whose first key holds an array, a nested map, a tag and a float before the key that is asked for.
+    test.assert(not smpbody.valid(bytes.zeros(3)))
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 6)
+    smpcbor.put_text(var cb, "a")
+    smpcbor.put_head(var cb, MAJOR_ARRAY, 2)
+    smpcbor.put_head(var cb, MAJOR_UINT, 300)
+    smpcbor.put_head(var cb, MAJOR_UINT, 70000)
+    smpcbor.put_text(var cb, "b")
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_uint(var cb, "x", 1)
+    smpcbor.put_text(var cb, "c")
+    smpcbor.put_head(var cb, 6, 1)
+    smpcbor.put_head(var cb, MAJOR_UINT, 2)
+    smpcbor.put_text(var cb, "d")
+    let _ = cb.push(0xFB as u8)
+    for _i in 0..8
+        let _ = cb.push(0 as u8)
+    smpcbor.put_uint(var cb, "off", 4000000000)
+    smpcbor.put_text(var cb, "t")
+    smpcbor.put_head(var cb, MAJOR_BYTES, 2)
+    let _ = cb.push(1 as u8)
+    let _ = cb.push(2 as u8)
+    let p = done()
+    test.assert(smpbody.valid(p))
+    test.assert_eq(smpbody.uint(p, "off", 0 - 1), 4000000000)
+    test.assert_eq(smpbody.uint(p, "absent", 7), 7)
+    test.assert_eq(smpbody.uint(p, "t", 7), 7)
+    test.assert_eq(smpbody.text(p, "t"), "")
+    test.assert_eq(bytes.len(smpbody.bytes_of(p, "t")), 2)
+    test.assert_eq(bytes.len(smpbody.bytes_of(p, "off")), 0)
+    test.assert(smpbody.has_bytes(p, "t"))
+    test.assert(not smpbody.has_bytes(p, "off"))
+    test.assert_eq(smpbody.rc_of(p), 0)
+    test.assert_eq(smpbody.uint_in(p, SMP_HDR_BYTES, "off", 0), 4000000000)
+    test.assert(not smpbody.bool_in(p, SMP_HDR_BYTES, "off", false))
+    test.assert(smpbody.bool_in(p, SMP_HDR_BYTES, "off", true))
+
+    test.case("an indefinite length, a reserved head and a string that runs off the end are not valid")
+    let good = rc_pkt(0)
+    var bad: [Int] = []
+    for i in 0..bytes.len(good)
+        list.push(bad, bytes.byte_at(good, i) ?? 0)
+    bad[8] = 0xBF
+    test.assert(not smpbody.valid(bytes.from_byte_list(bad)))
+    bad[8] = 0xA1
+    list.push(bad, 0)
+    bad[3] = bad[3] + 1
+    test.assert(not smpbody.valid(bytes.from_byte_list(bad)))
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_text(var cb, "k")
+    smpcbor.put_head(var cb, MAJOR_TEXT, 20)
+    test.assert(not smpbody.valid(done()))
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_head(var cb, MAJOR_UINT, 1)
+    smpcbor.put_uint(var cb, "k", 1)
+    test.assert(not smpbody.valid(done()))
+    // A header with the reserved bits set, and one of a version the protocol does not define.
+    var hdr: [Int] = []
+    for i in 0..bytes.len(good)
+        list.push(hdr, bytes.byte_at(good, i) ?? 0)
+    hdr[0] = 0x20
+    test.assert(not smpbody.valid(bytes.from_byte_list(hdr)))
+    hdr[0] = 0x18
+    test.assert(not smpbody.valid(bytes.from_byte_list(hdr)))
+    // A head whose argument is 0xFFFFFFFFFFFFFFFF of an array, and a key under which nothing sits.
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_text(var cb, "k")
+    smpcbor.put_head(var cb, MAJOR_ARRAY, 200000)
+    test.assert(not smpbody.valid(done()))
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_text(var cb, "k")
+    test.assert(not smpbody.valid(done()))
+    test.assert_eq(smpbody.seq_of(bytes.zeros(2)), 0 - 1)
+
+@test
+fn test_the_readers_of_a_body_survive_what_a_server_may_send() [mutate]
+    // The readers are public and are given packets that did not pass `valid`: they answer a fallback and read nothing past the end.
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_text(var cb, "k")
+    let _ = cb.push(0x19 as u8)
+    let _ = cb.push(1 as u8)
+    let cut_head = done()
+    test.assert(not smpbody.valid(cut_head))
+    test.assert_eq(smpbody.uint(cut_head, "k", 5), 5)
+
+    test.case("a position that is no map, a key that is no text, a key that is cut, a value that is cut")
+    let good = rc_pkt(3)
+    test.assert(not smpbody.find(good, 1000, "rc").found)
+    test.assert(not smpbody.find(good, 0, "rc").found)
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_head(var cb, MAJOR_UINT, 1)
+    smpcbor.put_head(var cb, MAJOR_UINT, 2)
+    let numeric_key = done()
+    test.assert(smpbody.valid(numeric_key))
+    test.assert(not smpbody.find(numeric_key, SMP_HDR_BYTES, "rc").found)
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_head(var cb, MAJOR_TEXT, 30)
+    test.assert(not smpbody.find(done(), SMP_HDR_BYTES, "rc").found)
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_text(var cb, "rc")
+    test.assert(not smpbody.find(done(), SMP_HDR_BYTES, "rc").found)
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 2)
+    smpcbor.put_text(var cb, "a")
+    smpcbor.put_head(var cb, MAJOR_TEXT, 30)
+    smpcbor.put_uint(var cb, "rc", 1)
+    test.assert(not smpbody.find(done(), SMP_HDR_BYTES, "rc").found)
+
+    test.case("the fallbacks of the readers by position")
+    test.assert_eq(smpbody.uint_in(good, SMP_HDR_BYTES, "absent", 9), 9)
+    start(0, 0, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_bool(var cb, "flag", false)
+    let flag = done()
+    test.assert(not smpbody.bool_in(flag, SMP_HDR_BYTES, "flag", true))
+    test.assert_eq(smpbody.rc_of(good), 3)
+
+@test
+fn test_an_upload_follows_the_offsets_the_server_answers() [mutate]
+    let dev = smpscript.scripted()
+    let img = fake_image(100, 0x5A)
+    dev.answer(off_pkt(40, 0))
+    dev.answer(off_pkt(80, 0))
+    dev.answer(off_pkt(100, 0))
+    reset_count(0)
+    match smpapi.image_upload_to(dev, 0, img, smpapi.with_chunk(opt(), 40), Count { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            test.assert_eq(u.requests, 3)
+            test.assert_eq(u.resumed_at, 0)
+    test.assert_eq(seen_steps, 3)
+    test.assert_eq(seen_done, 100)
+    test.assert_eq(seen_total, 100)
+
+    test.case("the first request carries the length and the hash of the image, the others do not")
+    let first = dev.request(0)
+    let second = dev.request(1)
+    test.assert(bytes.len(first) > bytes.len(second) - 20)
+    test.assert(smpbody.has_bytes(first, "sha"))
+    test.assert(not smpbody.has_bytes(second, "sha"))
+    test.assert_eq(smpbody.uint(first, "len", 0), 100)
+    test.assert_eq(smpbody.uint(second, "off", 0), 40)
+
+    test.case("a first answer past the first chunk is a resume, and the bytes before it are not sent")
+    let again = smpscript.scripted()
+    again.answer(off_pkt(80, 0))
+    again.answer(off_pkt(100, 0))
+    match smpapi.image_upload_to(again, 0, img, smpapi.with_chunk(opt(), 40), Silent { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            test.assert_eq(u.requests, 2)
+            test.assert_eq(u.resumed_at, 80)
+    test.assert_eq(smpbody.uint(again.request(1), "off", 0), 80)
+
+    test.case("the callback that answers false stops the upload, and a call that follows goes on")
+    let cut = smpscript.scripted()
+    cut.answer(off_pkt(40, 0))
+    cut.answer(off_pkt(80, 0))
+    reset_count(2)
+    test.assert_eq(code_of(smpapi.image_upload_to(cut, 0, img, smpapi.with_chunk(opt(), 40), Count { id: 0 })), E_CANCELLED)
+    test.assert_eq(cut.requests(), 2)
+    test.assert_eq(seen_done, 80)
+
+    test.case("a callback that says no after the last request has nothing left to stop")
+    let last = smpscript.scripted()
+    last.answer(off_pkt(100, 0))
+    reset_count(1)
+    test.assert_eq(code_of(smpapi.image_upload_to(last, 0, img, smpapi.with_chunk(opt(), 200), Count { id: 0 })), 0)
+
+    test.case("an offset past the end of the file, a refused image, and an empty file")
+    let far = smpscript.scripted()
+    far.answer(off_pkt(101, 0))
+    test.assert_eq(code_of(smpapi.image_upload_to(far, 0, img, opt(), Silent { id: 0 })), E_BAD_ANSWER)
+    far.answer(rc_pkt(EINVAL))
+    test.assert_eq(code_of(smpapi.image_upload_to(far, 0, img, opt(), Silent { id: 0 })), EINVAL)
+    test.assert_eq(code_of(smpapi.image_upload_to(far, 1, bytes.zeros(0), opt(), Silent { id: 0 })), 0)
+    test.assert_eq(far.requests(), 2)
+
+    test.case("the transport's limit and the chunk the caller asks for bound a request")
+    let small = smpscript.scripted()
+    small.set_limit(150)
+    small.answer(off_pkt(54, 0))
+    small.answer(off_pkt(100, 0))
+    match smpapi.image_upload_to(small, 1, img, opt(), Silent { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(u)  => test.assert_eq(u.requests, 2)
+    test.assert(bytes.len(small.request(0)) <= 150)
+
+    test.case("a limit below what the keys of a request need leaves a chunk of one byte")
+    let tiny = smpscript.scripted()
+    tiny.set_limit(90)
+    tiny.answer(off_pkt(1, 0))
+    tiny.answer(off_pkt(2, 0))
+    tiny.answer(off_pkt(3, 0))
+    match smpapi.image_upload_to(tiny, 1, bytes.from_str("abc"), opt(), Silent { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(u)  => test.assert_eq(u.requests, 3)
+
+@test
+fn test_the_hash_of_the_listed_image_is_the_hash_of_the_file() [mutate]
+    let img = fake_image(100, 0x5A)
+    let dev = smpscript.scripted()
+    dev.answer(off_pkt(100, 0))
+    dev.answer(list_pkt(0x11, 0x5A))
+    test.assert_eq(code_of(smpapi.image_upload(dev, img, opt(), Silent { id: 0 })), 0)
+
+    test.case("a list that holds another hash: the upload is refused")
+    dev.answer(off_pkt(100, 0))
+    dev.answer(list_pkt(0x11, 0x22))
+    test.assert_eq(code_of(smpapi.image_upload(dev, img, opt(), Silent { id: 0 })), E_HASH)
+
+    test.case("a list that cannot be read, and an upload that fails before the list")
+    dev.answer(off_pkt(100, 0))
+    dev.answer(rc_pkt(EBUSY))
+    test.assert_eq(code_of(smpapi.image_upload(dev, img, opt(), Silent { id: 0 })), EBUSY)
+    dev.answer(rc_pkt(EACCESSDENIED))
+    test.assert_eq(code_of(smpapi.image_upload(dev, img, opt(), Silent { id: 0 })), EACCESSDENIED)
+
+    test.case("a file with no hash to read is uploaded and not listed")
+    let other = payload(100, 3)
+    let plain = smpscript.scripted()
+    plain.answer(off_pkt(100, 0))
+    test.assert_eq(code_of(smpapi.image_upload(plain, other, opt(), Silent { id: 0 })), 0)
+    test.assert_eq(plain.requests(), 1)
+
+    test.case("the hash of a NOVB image, of a package around one, and of a file that is neither")
+    test.assert_eq(bytes.len(smpapi.expected_hash(img)), 32)
+    test.assert_eq(bytes.byte_at(smpapi.expected_hash(smppack.wrap(img)), 5) ?? 0 - 1, 0x5A)
+    test.assert_eq(bytes.len(smpapi.expected_hash(other)), 0)
+    test.assert_eq(bytes.len(smpapi.expected_hash(bytes.from_str("NOVB"))), 0)
+
+@test
+fn test_the_files_of_the_volume_go_up_and_come_down_by_the_script() [mutate]
+    let dev = smpscript.scripted()
+    let file = payload(300, 5)
+    dev.answer(off_pkt(100, 0))
+    dev.answer(off_pkt(200, 0))
+    dev.answer(off_pkt(300, 0))
+    reset_count(0)
+    test.assert_eq(code_of(smpapi.fs_upload(dev, "/f", file, smpapi.with_chunk(opt(), 100), Count { id: 0 })), 0)
+    test.assert_eq(seen_steps, 3)
+    test.assert_eq(smpbody.uint(dev.request(0), "len", 0), 300)
+
+    test.case("an empty file is one request, a callback that stops it is a stop, and a server that asks for too much is refused")
+    dev.answer(empty_pkt())
+    test.assert_eq(code_of(smpapi.fs_upload(dev, "/e", bytes.zeros(0), opt(), Silent { id: 0 })), 0)
+    dev.answer(off_pkt(100, 0))
+    reset_count(1)
+    test.assert_eq(code_of(smpapi.fs_upload(dev, "/f", file, smpapi.with_chunk(opt(), 100), Count { id: 0 })), E_CANCELLED)
+    dev.answer(off_pkt(400, 0))
+    test.assert_eq(code_of(smpapi.fs_upload(dev, "/f", file, opt(), Silent { id: 0 })), E_BAD_ANSWER)
+    dev.answer(rc_pkt(ENOENT))
+    test.assert_eq(code_of(smpapi.fs_upload(dev, "/f", file, opt(), Silent { id: 0 })), ENOENT)
+
+    test.case("a download is read chunk by chunk until the length the server stated")
+    dev.answer(data_pkt(250, 100))
+    dev.answer(data_pkt(250, 100))
+    dev.answer(data_pkt(250, 50))
+    reset_count(0)
+    match smpapi.fs_download(dev, "/f", opt(), Count { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(b)  =>
+            test.assert_eq(bytes.len(b), 250)
+            test.assert_eq(bytes.byte_at(b, 101) ?? 0 - 1, 7)
+    test.assert_eq(seen_total, 250)
+
+    test.case("a download of an empty file, one with no data, one that is stopped, one the server refuses")
+    dev.answer(data_pkt(0, 0))
+    test.assert_eq(code_of(smpapi.fs_download(dev, "/e", opt(), Silent { id: 0 })), 0)
+    dev.answer(off_pkt(0, 10))
+    test.assert_eq(code_of(smpapi.fs_download(dev, "/f", opt(), Silent { id: 0 })), E_BAD_ANSWER)
+    dev.answer(data_pkt(250, 100))
+    reset_count(1)
+    test.assert_eq(code_of(smpapi.fs_download(dev, "/f", opt(), Count { id: 0 })), E_CANCELLED)
+    dev.answer(rc_pkt(ENOENT))
+    test.assert_eq(code_of(smpapi.fs_download(dev, "/f", opt(), Silent { id: 0 })), ENOENT)
+
+    test.case("the status, the hash and the close")
+    dev.answer(off_pkt(0, 777))
+    match smpapi.fs_status(dev, "/f", opt())
+        Ok(n)  => test.assert_eq(n, 777)
+        Err(_) => test.assert(false)
+    dev.answer(rc_pkt(ENOENT))
+    test.assert_eq(code_of(smpapi.fs_status(dev, "/f", opt())), ENOENT)
+    start(8, 2, 0)
+    smpcbor.put_head(var cb, MAJOR_MAP, 2)
+    smpcbor.put_uint(var cb, "output", 0xDEADBEEF)
+    smpcbor.put_uint(var cb, "len", 12)
+    dev.answer(done())
+    match smpapi.fs_hash(dev, "/f", opt())
+        Ok(h)  =>
+            test.assert_eq(h.crc32, 0xDEADBEEF)
+            test.assert_eq(h.len, 12)
+        Err(_) => test.assert(false)
+    dev.answer(rc_pkt(ENOENT))
+    test.assert_eq(code_of(smpapi.fs_hash(dev, "/f", opt())), ENOENT)
+    dev.answer(empty_pkt())
+    test.assert_eq(code_of(smpapi.fs_close(dev, opt())), 0)
+
+@test
+fn test_a_scripted_device_says_what_it_holds() [mutate]
+    let dev = smpscript.scripted()
+    test.assert_eq(dev.requests(), 0)
+    test.assert_eq(dev.pending(), 0)
+    test.assert_eq(dev.mtu(), 0)
+    dev.set_limit(64)
+    test.assert_eq(dev.mtu(), 64)
+
+    test.case("an answer with no request before it is delivered as it is")
+    let p = empty_pkt()
+    dev.answer(p)
+    match dev.recv(10)
+        None    => test.assert(false)
+        Some(q) => test.assert_eq(bytes.len(q), bytes.len(p))
+    test.assert(dev.recv(10) == None)
+
+    test.case("a packet shorter than a header is stamped as it is")
+    test.assert(dev.send(bytes.from_byte_list([1, 2])))
+    dev.answer(bytes.from_byte_list([9, 9]))
+    match dev.recv(10)
+        None    => test.assert(false)
+        Some(q) => test.assert_eq(bytes.len(q), 2)
+
+// ── The server of mcumgr-nv in the same process ─────────────────────────
+
+var srv          = smpstate.session()
+var ram          = bootram.ram_slots(256, 64)
+var inbox: [Int] = []
+var at           = 0
+var drop         = 0
+var sent         = 0
+
+@value
+struct SrvPort
+    id: Int
+
+impl SmpPort[mutate] for SrvPort
+    fn take_byte(self) -> Int [mutate]
+        0 - 1
+
+    fn put_byte(self, b: Int) [mutate]
+        if drop <= 0
+            list.push(inbox, b)
+
+// A wire to the session.  While `drop` is above 0 the answers to that many requests are lost.
+@value
+struct Loop
+    id: Int
+
+impl Wire[mutate] for Loop
+    fn send(self, data: Bytes) -> Bool [mutate]
+        sent = sent + 1
+        for i in 0..bytes.len(data)
+            let done = smpsess.feed(smpboot.ram_store(ram), smpsim.sim_os(ram), RamFile { id: 0 }, SrvPort { id: 0 },
+                                    var srv, bytes.byte_at(data, i) ?? 0)
+            if done and drop > 0
+                drop = drop - 1
+        true
+
+    fn recv(self, ms: Int) -> Int [mutate]
+        if at < inbox.len()
+            let v = inbox[at]
+            at = at + 1
+            return v
+        0 - 1
+
+fn lp() -> Framed<Loop>
+    Framed { wire: Loop { id: 0 } }
+
+fn fresh() [mutate]
+    ram = bootram.ram_slots(256, 64)
+    smpboot.set_policy(HB, CHIP, BOARD, 0)
+    srv = smpstate.session()
+    inbox = []
+    at = 0
+    drop = 0
+    sent = 0
+    let _ = smpram.ram_file()
+
+fn put_slot(slot: Int, img: Bytes) [mutate]
+    for i in 0..bytes.len(img)
+        bootram.poke(slot, i, bytes.byte_at(img, i) ?? 0xFF)
+
+fn image(version: Int, n: Int, salt: Int) -> Bytes
+    hostimg.image(CHIP, BOARD, HB, version, salt, true, payload(n, salt))
+
+@test
+fn test_an_image_goes_up_is_listed_tested_and_confirmed_through_the_server() [mutate]
+    fresh()
+    let old = image(0x01000000, 2000, 9)
+    let img = image(0x01020003, 3000, 1)
+    put_slot(0, old)
+    match smpapi.image_list(lp(), opt())
+        Err(_)    => test.assert(false)
+        Ok(slots) =>
+            test.assert_eq(slots.len(), 1)
+            test.assert(slots[0].active and slots[0].confirmed)
+
+    test.case("the upload is checked against the list the server holds afterwards")
+    reset_count(0)
+    match smpapi.image_upload(lp(), img, smpapi.with_chunk(opt(), 200), Count { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            test.assert(u.requests > 10)
+            test.assert_eq(u.resumed_at, 0)
+    test.assert_eq(seen_done, bytes.len(img))
+
+    test.case("a test marks it pending, a confirm after the restart makes it the running image")
+    let digest = smpapi.expected_hash(img)
+    match smpapi.image_test(lp(), digest, opt())
+        Err(_)    => test.assert(false)
+        Ok(slots) =>
+            test.assert_eq(slots.len(), 2)
+            test.assert(slots[1].pending)
+            test.assert_eq(bytes.to_hex(slots[1].hash), bytes.to_hex(digest))
+    test.assert_eq(code_of(smpapi.reset(lp(), opt())), 0)
+
+    test.case("a package carries the same image")
+    fresh()
+    put_slot(0, old)
+    test.assert_eq(code_of(smpapi.image_upload(lp(), smppack.wrap(img), opt(), Silent { id: 0 })), 0)
+
+    test.case("a refused image is the server's code, and an erase empties the second slot")
+    fresh()
+    let other = hostimg.image(0x999, BOARD, HB, 1, 1, true, payload(500, 1))
+    test.assert_eq(code_of(smpapi.image_upload(lp(), other, opt(), Silent { id: 0 })), EINVAL)
+    fresh()
+    put_slot(0, old)
+    test.assert_eq(code_of(smpapi.image_upload(lp(), img, opt(), Silent { id: 0 })), 0)
+    test.assert_eq(code_of(smpapi.image_erase(lp(), opt())), 0)
+    match smpapi.image_list(lp(), opt())
+        Err(_)    => test.assert(false)
+        Ok(slots) => test.assert_eq(slots.len(), 1)
+
+@test
+fn test_an_upload_that_stopped_half_way_resumes_at_the_offset_the_server_kept() [mutate]
+    fresh()
+    let old = image(0x01000000, 2000, 9)
+    let img = image(0x01020003, 3000, 1)
+    put_slot(0, old)
+    let chunk = smpapi.with_chunk(opt(), 200)
+
+    test.case("the callback cuts the upload at the twelfth request")
+    reset_count(12)
+    test.assert_eq(code_of(smpapi.image_upload(lp(), img, chunk, Count { id: 0 })), E_CANCELLED)
+    let kept = seen_done
+    test.assert(kept > 0 and kept < bytes.len(img))
+    match smpapi.image_list(lp(), opt())
+        Err(_)    => test.assert(false)
+        Ok(slots) => test.assert_eq(slots.len(), 1)
+
+    test.case("the device lost its session, as a reset loses it: the same call again is answered where the server stopped")
+    srv = smpstate.session()
+    inbox = []
+    at = 0
+    reset_count(0)
+    var again = 0
+    match smpapi.image_upload(lp(), img, chunk, Count { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            again = u.requests
+            // The server writes a page of 512 bytes after the header, and asks again for the page it may have torn.
+            test.assert(u.resumed_at > 1024 and u.resumed_at <= kept)
+            test.assert_eq((u.resumed_at - HB) % 512, 0)
+    test.assert(again < 10)
+    test.assert_eq(seen_done, bytes.len(img))
+
+@test
+fn test_a_lost_answer_stops_an_upload_with_one_try_and_a_second_call_goes_on() [mutate]
+    fresh()
+    let old = image(0x01000000, 2000, 9)
+    let img = image(0x01020003, 3000, 1)
+    put_slot(0, old)
+    let chunk = smpapi.with_chunk(smpapi.options(20, 1), 200)
+
+    test.case("the answer to the thirteenth request is lost: with one try the upload fails there")
+    reset_count(0)
+    drop_at = 12
+    test.assert_eq(code_of(smpapi.image_upload(lp(), img, chunk, Count { id: 0 })), E_NO_ANSWER)
+    test.assert_eq(seen_done, 2400)
+
+    test.case("a new link to the device after a reset: the first answer is the offset the server kept, and the rest goes up")
+    srv = smpstate.session()
+    inbox = []
+    at = 0
+    drop = 0
+    drop_at = 0
+    reset_count(0)
+    match smpapi.image_upload(lp(), img, chunk, Count { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            test.assert(u.resumed_at > 1024 and u.resumed_at <= 2600)
+            test.assert(u.requests < 10)
+    test.assert_eq(seen_done, bytes.len(img))
+
+@test
+fn test_a_file_goes_up_and_comes_down_through_the_server() [mutate]
+    fresh()
+    let file = payload(600, 7)
+    reset_count(0)
+    test.assert_eq(code_of(smpapi.fs_upload(lp(), "/data/log", file, opt(), Count { id: 0 })), 0)
+    test.assert(seen_steps >= 2)
+    match smpapi.fs_status(lp(), "/data/log", opt())
+        Ok(n)  => test.assert_eq(n, 600)
+        Err(_) => test.assert(false)
+    match smpapi.fs_hash(lp(), "/data/log", opt())
+        Ok(h)  =>
+            test.assert_eq(h.len, 600)
+            test.assert(h.crc32 != 0)
+        Err(_) => test.assert(false)
+    match smpapi.fs_download(lp(), "/data/log", opt(), Silent { id: 0 })
+        Err(_) => test.assert(false)
+        Ok(b)  =>
+            test.assert_eq(bytes.len(b), 600)
+            test.assert_eq(bytes.to_hex(b), bytes.to_hex(file))
+    test.assert_eq(code_of(smpapi.fs_download(lp(), "/absent", opt(), Silent { id: 0 })), ENOENT)
+    test.assert_eq(code_of(smpapi.fs_close(lp(), opt())), 0)
+    match smpapi.echo(lp(), "hello", opt())
+        Ok(s)  => test.assert_eq(s, "hello")
+        Err(_) => test.assert(false)
+    match smpapi.params(lp(), opt())
+        Ok(p)  => test.assert(p.buf_size > 0)
+        Err(_) => test.assert(false)

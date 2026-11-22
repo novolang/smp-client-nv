@@ -24,6 +24,7 @@ use smpsess
 use smpboot
 use smpsim
 use smpram
+use smpapi
 use smpclient
 use smpcli
 use smppack
@@ -147,8 +148,9 @@ fn test_a_lost_response_is_asked_for_again() [io, fs, mutate]
     test.assert_eq(smpclient.echo(lp(), "fresh", 100, 1), 0)
 
     test.case("a wire that cannot send, and a server that never answers")
-    test.assert_eq(smpclient.echo(dp(), "x", 10, 1), 0 - 1)
-    test.assert_eq(smpclient.echo(dp(), "x", 10, 2), 0 - 1)
+    test.assert_eq(smpclient.echo(dp(), "x", 10, 1), E_SEND)
+    test.assert_eq(smpclient.echo(dp(), "x", 10, 2), E_SEND)
+    test.assert_eq(smpclient.params(dp(), 10, 1), E_SEND)
 
 @test
 fn test_an_image_goes_up_is_listed_tested_and_confirmed() [io, fs, mutate]
@@ -430,13 +432,15 @@ fn test_answers_that_lack_what_the_command_prints_are_survived() [io, fs, net, m
 
     test.case("a download answer with no data is refused by the client")
     script(3)
-    test.assert_eq(smpclient.fs_download(sc(), "/f", tmp("none"), 100, 1), EINVAL)
+    test.assert_eq(smpclient.fs_download(sc(), "/f", tmp("none"), 100, 1), E_BAD_ANSWER)
 
     test.case("a server that asks for another offset is followed")
     script(4)
     test.assert_eq(smpclient.image_upload(sc(), payload(100, 1), 40, 100, 1), 0)
+
+    test.case("a server that asks for an offset past the end of the file is refused")
     script(4)
-    test.assert_eq(smpclient.fs_upload(sc(), "/f", payload(100, 1), 100, 1), 0)
+    test.assert_eq(smpclient.fs_upload(sc(), "/f", payload(100, 1), 100, 1), E_BAD_ANSWER)
 
 @test
 fn test_a_file_that_cannot_be_written_is_the_error() [io, fs, net, mutate]

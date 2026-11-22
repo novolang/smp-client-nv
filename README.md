@@ -5,33 +5,37 @@ nRF Connect Device Manager and `smpmgr` speak to a device that runs MCUboot,
 Zephyr, the nRF Connect SDK or Apache Mynewt.  A client lists the images a
 device holds, uploads a new one, marks it for a test and confirms it, and
 reads and writes the files of the device's volume.  This package is the client
-half of SMP for a host, written over the server half,
-[mcumgr-nv](https://novo-lang.org/packages/mcumgr-nv).  It holds a `Transport`
-trait with implementations for a serial port, a pipe and a TCP socket, the
-requests and the readings of the OS, image and file groups, and two commands:
-`smp-client-nv`, a client for a bench, and `novo-update`, which the toolchain
-runs as `novo update` to update a board and write its data region.
+half of SMP, written over the server half,
+[mcumgr-nv](https://novo-lang.org/packages/mcumgr-nv).  It holds a library
+(`smpapi`) whose commands return values and take their transport as an
+argument, a `Transport` trait with implementations for a serial port, a pipe, a
+TCP socket and a script for a test, and two commands: `smp-client-nv`, a client
+for a bench, and `novo-update`, which the toolchain runs as `novo update` to
+update a board and write its data region.
+
+The same calls serve a tool on a PC, a program on a board that is a Bluetooth
+Central and an application on a phone: each hands the library the `Transport`
+that reaches its device, and nothing else in the program changes.
 
 ## What it is
 
 A packet is an 8-byte header and a CBOR body, and a client sends one request at
 a time: it builds the packet, hands it to a `Transport`, reads packets until one
-carries the request's sequence number, and reads the code in it.  A request that
-is not answered within the timeout is sent again, up to a number of tries.
-Every command answers a code: 0 for success, the server's code for a request it
-refused, and -1 when no answer arrived.
+carries the request's sequence number and is whole, and reads the code in it.  A
+request that is not answered within the timeout is sent again, up to a number of
+tries.  A command of the library answers `Ok(value)` or `Err(SmpError)`; the
+error holds the code the server answered, or one of the codes of the client:
 
-What differs between the ways to reach a server is how a packet is carried.
-Two ways are in the package:
+| Code | Name | Meaning |
+| --- | --- | --- |
+| 1 to 11 | the server's | the server refused the request (`ENOENT` is 5, `EBADSTATE` 6, `EACCESSDENIED` 11) |
+| -1 | `E_NO_ANSWER` | no response arrived within the tries |
+| -10 | `E_SEND` | the transport refused the request |
+| -11 | `E_BAD_ANSWER` | a response had the request's number and was cut or malformed, or lacked what its command returns |
+| -12 | `E_HASH` | after an upload the server holds no image with the file's hash |
+| -13 | `E_CANCELLED` | the progress callback answered false |
 
-- **The console framing** of the serial transport, in which a packet is split
-  into base64 lines of at most 124 characters with a length and a CRC-16.  A
-  serial port, the pty of one, and a TCP socket carry it.
-- **The packet as it is**, one after the other, which a reader splits by the
-  length in the header.  A pipe to a relay carries it.  The relay of
-  noble-examples (`pc/ble_smp.nv`) is the one that puts the packets on the SMP
-  service of a device over Bluetooth Low Energy; the package has no Bluetooth
-  of its own.
+`SmpError.message()` says it in a sentence.
 
 ## Install
 
@@ -43,58 +47,190 @@ The commands need no install: `novo update` is shipped with the toolchain
 (`~/.novo/bin/novo-update` beside `novo`), and `smp-client-nv` is built with
 `novo pkg build`.
 
-## Example
+## The library
 
-A program that lists the images of a device on a serial port, uploads a new
-one and marks it for a test:
+`smpapi` has one function for each command.  `options(ms, tries)` says how long
+a command waits for each of its attempts and how many it makes; `with_chunk`
+caps the bytes of a file in one request, and the default is the most the buffer
+and the transport allow.
+
+| Call | Answers |
+| --- | --- |
+| `echo(t, text, o)` | `Str`, the text sent back |
+| `params(t, o)` | `Params`: the buffer size and count of the server |
+| `reset(t, o)`, `image_erase(t, o)`, `fs_close(t, o)` | `Unit` |
+| `image_list(t, o)`, `image_test(t, hash, o)`, `image_confirm(t, hash, o)` | `[Slot]`: image, slot, version, hash and the flags bootable, active, confirmed, pending, permanent |
+| `image_upload(t, file, o, p)` | `Upload`: the requests sent and the offset the first answer resumed at; then reads the list and checks that an image with the file's hash is there (`E_HASH` when none is) |
+| `image_upload_to(t, image, file, o, p)` | `Upload`, with no check; image 1 is the data region |
+| `fs_upload(t, name, file, o, p)`, `fs_download(t, name, o, p)` | `Unit`, `Bytes` |
+| `fs_status(t, name, o)`, `fs_hash(t, name, o)` | `Int`, the length; `FileHash`, the CRC-32 and the length |
+
+`p` is a `Progress`: a trait with one method, `step(done, total)`, called after
+each response of a transfer; `Silent` ignores it, and a `step` that answers
+false stops the transfer with `E_CANCELLED`.  An upload stopped that way, or cut
+by a link that went, resumes when the call is made again on a new transport:
+the first request is answered with the offset the server kept, and the bytes
+before it are not sent.
+
+An example over a serial port, with a progress line and a check:
 
 ```novo
 use std.fs
-use smpclient
+use smpapi
 use smptransport
 
+struct Bar
+    id: Int
+
+impl Progress[io, mutate] for Bar
+    fn step(self, done: Int, total: Int) -> Bool [io, mutate]
+        println("${done} of ${total} bytes")
+        true
+
 fn main() [io, fs, mutate]
-    // The port is put in raw mode at 115200 bits a second.
     match smptransport.open_serial("/dev/ttyACM0", 115200)
         None    => println("cannot open the port")
         Some(t) =>
-            // A command waits 10 seconds for an answer and asks 3 times.
-            let rc = smpclient.image_list(t, 10000, 3)
-            println("image list answered ${rc}")
             match fs.read_bytes("app.img")
                 None    => println("no app.img")
-                Some(b) => println("upload answered ${smpclient.image_upload(t, b, 0, 10000, 3)}")
+                Some(b) =>
+                    match smpapi.image_upload(t, b, smpapi.options(10000, 3), Bar { id: 0 })
+                        Ok(u)  => println("sent in ${u.requests} requests, resumed at ${u.resumed_at}")
+                        Err(e) => println(e.message())
 ```
 
-The commands do the same from a shell, and `novo update` adds what a board needs
-(its serial port found, the checks against its flash table, the restart waited
-for):
+## The transport
 
+```novo ignore
+pub trait Transport[e]
+    fn send(self, packet: Bytes) -> Bool [e, mutate]
+    fn recv(self, ms: Int) -> ?Bytes [e, mutate]
+    fn mtu(self) -> Int        // 0 unless the transport limits a packet
 ```
-novo update --target=nrf52840-dk --serial app.img --test --confirm
+
+`send` writes one packet, a header and its body, and says whether it was
+written.  `recv` answers the next packet, or `None` when none arrives within
+`ms` milliseconds or the link has closed.  `mtu` is the most bytes of a packet
+the transport carries; the client sizes an upload's chunk by the smaller of that
+and its own buffer, and the default body answers 0, no limit.  A transport that
+splits a packet, as Bluetooth does, joins the pieces in `recv` and answers it
+whole.  A struct is a reference, so a transport whose state changes with a
+packet keeps it in a struct reached through `self` (`smpscript.nv` is an
+example).
+
+The package implements it as:
+
+| Transport | Carries | Opened by |
+| --- | --- | --- |
+| `Framed` over `DevWire` | the console framing of the serial transport, over a serial port in raw mode, or a pty | `open_serial(path, baud)`, `open_dev(path)` |
+| `Framed` over `TcpWire` | the same, over a TCP socket | `connect(host, port, ms)` |
+| `Raw` over `PipeWire` | the packets as they are, over the standard input and output of a program | `spawn_pipe(argv)` |
+| `Scripted` | canned packets, for a test | `smpscript.scripted()` |
+
+A program with another way to carry bytes implements `Wire` (a byte at a time)
+and gets `Framed` or `Raw` over it; a program with another way to carry packets
+implements `Transport`.
+
+### Serial and TCP
+
+```novo
+use smpapi
+use smptransport
+
+fn main() [io, net, mutate]
+    match smptransport.connect("127.0.0.1", 5555, 3000)
+        None    => println("cannot connect")
+        Some(t) =>
+            match smpapi.echo(t, "hello", smpapi.options(2000, 2))
+                Ok(back) => println(back)
+                Err(e)   => println(e.message())
 ```
+
+`open_serial("/dev/ttyACM0", 115200)` is the same call for a port.  A frame
+goes to a serial port in writes of at most 64 bytes, as the J-Link serial port
+of the nRF52840-DK drops a longer one.
+
+### A pipe
+
+`spawn_pipe` starts a program and speaks to it in packets through its standard
+input and output.  A relay that holds a Bluetooth Controller is such a program:
+
+```novo
+use std.bytes
+use smpapi
+use smptransport
+
+fn main() [io, mutate]
+    match smptransport.spawn_pipe(["ble_smp", "/tmp/novo_hci.sock", "stdio", "AA:BB:CC:DD:EE:FF"])
+        None    => println("cannot start the relay")
+        Some(t) =>
+            match smpapi.image_confirm(t, bytes.zeros(0), smpapi.options(10000, 1))
+                Ok(slots) => println("${slots.len()} images")
+                Err(e)    => println(e.message())
+```
+
+### A script, for a test
+
+`smpscript` is a transport with no device behind it.  A test queues the packets
+the device would send, runs a command, and reads back what the command sent:
+
+```novo
+use smpapi
+use smpscript
+
+fn reset_is_answered(canned: Bytes) -> Bool [mutate]
+    let dev = smpscript.scripted()
+    dev.silence()                  // the first attempt times out
+    dev.answer(canned)             // the second is answered
+    match smpapi.reset(dev, smpapi.options(50, 2))
+        Ok(_)  => dev.requests() == 2
+        Err(_) => false
+```
+
+`answer` takes the sequence number of the request sent last, so a canned packet
+need not know it; `answer_raw` delivers a packet as it is, for a late answer to
+an earlier request; `silence` is a timeout; `refuse_sends(n)` makes the next `n`
+writes fail; `set_limit(n)` is the `mtu`.  `smpscript.packet_of` makes a packet
+from a buffer filled with the response builders of mcumgr-nv.
+
+### Bluetooth Low Energy
+
+The package has no Bluetooth and no dependency on a radio.  A program that owns
+a Bluetooth Host implements `Transport` over the Host's client of the SMP
+service, in about twenty lines; the package noble-examples holds that adapter
+for the noble Host, the module `smp_gatt_transport` (`GattLink`), and its program
+`ble_smp` runs `image list` over the air with it:
+
+```novo ignore
+let opened = smp_gatt_client.open(var ble, conn)
+let t = smp_gatt_transport.link(ble, opened.peer)
+let rc = smpclient.image_list(t, 10000, 1)
+```
+
+`send` writes the packet to the service's characteristic in pieces of
+`ATT_MTU - 3` bytes, and `recv` joins the notifications of the answer by the
+length in the header.  An application on a phone writes the same two methods
+over the phone's GATT client.  The dependency runs from the adapter to both
+sides: smp-client-nv knows no radio, and the Bluetooth packages know no client.
 
 ## What the package contains
 
 | Module | Contents |
 | --- | --- |
+| `smpapi` | The commands as functions that return values: `CallOptions`, `Progress`, `Slot`, `SmpError` and the calls above. |
+| `smpbody` | A response read as bytes: the check that a packet is whole (`valid`) and the readers of its keys, of any size and with arrays and nested maps. |
 | `smptransport` | The `Wire` trait (a byte at a time), the `Transport` trait (a packet at a time), `Framed` and `Raw` over a wire, `TcpWire`, `DevWire` and `PipeWire`, and `connect`, `open_dev`, `open_serial` and `spawn_pipe`. |
-| `smpclient` | The commands over a `Transport`: echo, parameters, reset, the image list, upload, test, confirm and erase, and the files' upload, download, status, hash and close. |
+| `smpscript` | `Scripted`, the transport of a test. |
+| `smpclient` | The commands that print: the library's calls with the lines `smp-client-nv` writes, and a code in place of a `Result`. |
 | `smpcli` | The commands of the `smp-client-nv` program, and the exit status. |
 | `update` | `novo update`: the command line, the board's flash table as the toolchain prints it, the listing of serial ports and of devices, and the upload with its trial, restart and confirmation. |
 
 The package that holds the server, mcumgr-nv, also holds `smpreq`, which builds
-the requests and reads the responses, and `smppack`, which writes the package
-that nRF Connect Device Manager reads; the suites of the server use both, so
-they stay there.
-
-## How to choose an entry point
-
-A program that talks to a device calls `smpclient` with a `Transport`.  A
-program that carries SMP some other way implements `Transport` (`send` writes a
-packet, `recv` answers the next one or `None` after a timeout) and passes it to
-the same calls.  A person at a terminal runs `smp-client-nv` for the requests as
-they are, or `novo update` for the update of a board.
+the requests, and `smppack`, which writes the package that nRF Connect Device
+Manager reads; the suites of the server use both, so they stay there.  The
+dependency runs from this package to mcumgr-nv: the client is written over the
+server's header, CBOR and framing and its suites run against the server's
+session, and the other direction would be a cycle.
 
 ## The commands
 
@@ -144,9 +280,9 @@ and 3 also for a board that does not answer within `--wait` of its restart.
 Bluetooth needs a program that has a Controller.  `novo update --ble` starts the
 relay named by `NOVO_UPDATE_BLE`, else `novo-update-ble` beside `novo`, else the
 one on PATH, with the socket of the bridge in front of the Controller
-(`NOVO_HCI_SOCKET`, `/tmp/novo_hci.sock` when unset).  The relay is `pc/ble_smp.nv`
-of noble-examples, built as `novo-update-ble`; it takes `scan` and `stdio
-ADDRESS` after the socket.
+(`NOVO_HCI_SOCKET`, `/tmp/novo_hci.sock` when unset).  The relay is the program
+`ble_smp` of noble-examples, built as `novo-update-ble`; it takes `scan` and
+`stdio ADDRESS` after the socket.
 
 ## The rules a user needs
 
@@ -155,7 +291,9 @@ ADDRESS` after the socket.
    takes for its slowest request, the erase of the second slot at the first
    request of an upload.
 2. **An upload that was cut resumes.**  The server answers the offset it
-   expects next, and the client goes on from there.
+   expects next, and the client goes on from there.  mcumgr-nv writes its pages
+   of 512 bytes after the header and asks again for the last page it may have
+   torn, so the offset of a resume lies behind the bytes sent by up to two pages.
 3. **A package and a bare image upload alike.**  The server stages the image
    and ignores the trailer.  The hash `--test` and `--confirm` name is the one in
    the image's header, which the package's trailer repeats.
@@ -166,13 +304,27 @@ ADDRESS` after the socket.
    link and opens it again until the board answers, so a serial port that
    disappears for a moment, or a Bluetooth connection, does not end the run.
 
-## What is not included
+## Limits
 
-- Bluetooth Low Energy.  The package has no Controller; the relay of
-  noble-examples carries the packets.
-- UDP, and the groups other than the OS, image and file groups: the server
-  answers 8 (not supported) to them.
-- A reader of the statistics, log or shell groups.
+- One request is in flight in a process.  The buffer a request is built in and
+  its sequence numbers belong to the package, so two threads must not call it at
+  the same time.
+- A request is at most `smp_buf_bytes` of mcumgr-nv's configuration (512 by
+  default) and at most the transport's `mtu`; a response may be of any size the
+  transport delivers.
+- A file upload goes whole or not at all: the server gathers the file in memory
+  and writes it when the last chunk has arrived, so an upload of a file that
+  stopped starts again from its first byte.  An image upload resumes.
+- The check of `image_upload` reads the hash of a NOVB image, or of the NOVB
+  image inside a package.  A file of another format is uploaded and not
+  checked; the commands of the programs do not check after an upload, and
+  `test HASH` is refused by a server that holds no such image.
+- There is no call that lists the files of a volume: the file group of SMP has
+  no such command, and the server of mcumgr-nv offers none.  A file is named by
+  its absolute path.
+- The package has no Bluetooth Low Energy and no UDP, and no reader of the
+  statistics, log, shell or settings groups: the server answers 8 (not
+  supported) to them.
 
 ## Related packages
 
@@ -186,7 +338,7 @@ ADDRESS` after the socket.
 
 ## Development
 
-The package depends on mcumgr-nv by the registry range `^0.2.0`, the published 0.2.0.
+The package depends on mcumgr-nv by the registry range `^0.2.0`.
 
 ```bash
 novo pkg build                                    # the smp-client-nv command
@@ -197,15 +349,16 @@ bash tests/coverage.sh
 ## Tests
 
 ```bash
+novo test tests/api_tests.nv        # 16: the library against a script (codes, a lost answer, an answer of another request, a cut packet, a hash that differs, resume, progress) and against the server in the same process
 novo test tests/client_tests.nv     # 16: the commands against a server in the same process, a socket, a pipe, a descriptor, a serial port
 novo test tests/transport_tests.nv  #  4: a packet across a pipe, the framing and the pieces of a write, the opening of a serial port
 novo test tests/update_tests.nv     # 21: the command line, the board, the listing, the flow of an update
 novo test tests/volume_tests.nv     #  1: a data image into the data region and the files of its volume
 ```
 
-`tests/coverage.sh` merges the suites and reports the line coverage of `src/`.
-The gate in the novo repository (`tests/orbit/test_smp_client_nv.sh`) runs the
-commands against mcumgr-nv's host server, over TCP and over a pty.
+`tests/coverage.sh` merges the suites and reports the line coverage of `src/`:
+100 %.  The toolchain's repository runs the commands against mcumgr-nv's host
+server, over TCP and over a pty, as a gate.
 
 ## Licence
 

@@ -32,6 +32,7 @@
 
 use std.bytes
 use std.fs
+use smpapi
 use smpclient
 use smppack
 use smptransport
@@ -204,7 +205,7 @@ pub fn status(rc: Int) -> Int [io]
         usage()
         return 2
     if rc < 0
-        eprintln("smp-client-nv: no answer")
+        eprintln("smp-client-nv: ${SmpError { code: rc }.message()}")
         return 3
     eprintln("smp-client-nv: the server answered code ${rc}")
     1

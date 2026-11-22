@@ -1,0 +1,241 @@
+// smpbody: a response packet read as bytes.
+//
+// A response is the 8-byte header and a body, a CBOR map of text keys.  The server of mcumgr-nv writes flat maps, a Zephyr server
+// writes an array of maps under `images`, and any server may write keys after an array.  This module reads such a packet without
+// a buffer of the package's configuration, so the size of a response is the size the transport delivered, and it checks every
+// head against the end of the packet before it reads on: a packet cut anywhere is refused by `valid`, never read past its end.
+//
+// `valid` is the one check.  The readers after it take a packet that passed it, and answer a fallback for a key that is absent or
+// of another type.
+
+use std.bytes
+use smphdr
+
+// The deepest nesting of arrays, maps and tags `valid` accepts: the body map, the array of `images`, and a map inside it.
+const MAX_DEPTH = 4
+
+// The most pairs or elements of one map or array that `valid` accepts, which no packet of the protocol comes near.
+const MAX_ITEMS = 4096
+
+// A head read at a position: the major type, the argument, and the position after the head.  `ok` is false when the head runs past
+// the end of the packet, is reserved or has an indefinite length.
+@value
+struct Head
+    ok: Bool
+    major: Int
+    arg: Int
+    next: Int
+
+// The value of a key: whether it is there, its major type, its argument (the number, or the length of a string, or the count of
+// an array or map), the position after its head, which is where a string's bytes or an array's first element start, and the
+// position of its head.
+pub @value
+struct Val
+    found: Bool
+    major: Int
+    arg: Int
+    at: Int
+    head: Int
+
+// The major type of an unsigned number.
+pub const T_UINT = 0
+
+// The major type of a byte string.
+pub const T_BYTES = 2
+
+// The major type of a text string.
+pub const T_TEXT = 3
+
+// The major type of an array.
+pub const T_ARRAY = 4
+
+// The major type of a map.
+pub const T_MAP = 5
+
+// The major type of a simple value: a boolean, null or a float.
+pub const T_SIMPLE = 7
+
+// The unsigned number of `n` bytes at `at`, big-endian, or -1 when the packet ends first.
+@tier(app)
+fn be(p: Bytes, at: Int, n: Int) -> Int
+    if at + n > bytes.len(p)
+        return 0 - 1
+    var v = 0
+    for i in 0..n
+        v = (v << 8) | (bytes.byte_at(p, at + i) ?? 0)
+    v
+
+// The head at `at`.
+@tier(app)
+fn head_at(p: Bytes, at: Int) -> Head
+    let bad = Head { ok: false, major: 0, arg: 0, next: at }
+    if at < 0 or at >= bytes.len(p)
+        return bad
+    let b0 = bytes.byte_at(p, at) ?? 0
+    let major = b0 >> 5
+    let info = b0 & 31
+    if info < 24
+        return Head { ok: true, major: major, arg: info, next: at + 1 }
+    if info > 27
+        return bad
+    var n = 1
+    if info == 25
+        n = 2
+    if info == 26
+        n = 4
+    if info == 27
+        n = 8
+    let v = be(p, at + 1, n)
+    if v < 0
+        return bad
+    Head { ok: true, major: major, arg: v, next: at + 1 + n }
+
+// The position after the item that starts at `at`, or -1 when the item is cut, malformed or nested deeper than `depth` allows.
+@tier(app)
+fn skip(p: Bytes, at: Int, depth: Int) -> Int
+    let h = head_at(p, at)
+    if not h.ok or depth > MAX_DEPTH
+        return 0 - 1
+    if h.major == 2 or h.major == 3
+        if h.arg > bytes.len(p) - h.next
+            return 0 - 1
+        return h.next + h.arg
+    if h.major == 4 or h.major == 5
+        if h.arg > MAX_ITEMS or h.arg > bytes.len(p)
+            return 0 - 1
+        var pos = h.next
+        var count = h.arg
+        if h.major == 5
+            count = h.arg * 2
+        for _i in 0..count
+            pos = skip(p, pos, depth + 1)
+            if pos < 0
+                return 0 - 1
+        return pos
+    if h.major == 6
+        return skip(p, h.next, depth + 1)
+    h.next
+
+// Whether `p` is a response packet: a header the protocol defines, a body of the length the header names, and a body that is one
+// definite CBOR map whose every item is whole.
+@tier(app)
+pub fn valid(p: Bytes) -> Bool
+    let n = bytes.len(p)
+    if n < SMP_HDR_BYTES
+        return false
+    let b0 = bytes.byte_at(p, 0) ?? 0
+    if (b0 >> 5) != 0 or ((b0 >> 3) & 3) > VER_DETAILED
+        return false
+    let body = ((bytes.byte_at(p, 2) ?? 0) << 8) | (bytes.byte_at(p, 3) ?? 0)
+    if n != SMP_HDR_BYTES + body
+        return false
+    let m = head_at(p, SMP_HDR_BYTES)
+    if not m.ok or m.major != 5
+        return false
+    skip(p, SMP_HDR_BYTES, 0) == n
+
+// The sequence number of the packet's header, or -1 when it holds no header.
+@tier(app)
+pub fn seq_of(p: Bytes) -> Int
+    if bytes.len(p) < SMP_HDR_BYTES
+        return 0 - 1
+    bytes.byte_at(p, 6) ?? 0
+
+// The value under `key` in the map that starts at `at`.
+@tier(app)
+pub fn find(p: Bytes, at: Int, key: Str) -> Val
+    let none = Val { found: false, major: 0, arg: 0, at: 0, head: 0 }
+    let m = head_at(p, at)
+    if not m.ok or m.major != 5 or m.arg > MAX_ITEMS
+        return none
+    var pos = m.next
+    for _i in 0..m.arg
+        let k = head_at(p, pos)
+        if not k.ok or k.major != 3 or k.arg > bytes.len(p) - k.next
+            return none
+        let v = head_at(p, k.next + k.arg)
+        if not v.ok
+            return none
+        if text_is(p, k.next, k.arg, key)
+            return Val { found: true, major: v.major, arg: v.arg, at: v.next, head: k.next + k.arg }
+        pos = skip(p, k.next + k.arg, 1)
+        if pos < 0
+            return none
+    none
+
+// Whether the `n` bytes at `at` spell `key`.
+@tier(app)
+fn text_is(p: Bytes, at: Int, n: Int, key: Str) -> Bool
+    if str.len(key) != n
+        return false
+    for i in 0..n
+        if (bytes.byte_at(p, at + i) ?? (0 - 1)) != str.byte_at_or(key, i, 0 - 2)
+            return false
+    true
+
+// The unsigned number under `key` of the body, or `fallback`.
+@tier(app)
+pub fn uint(p: Bytes, key: Str, fallback: Int) -> Int
+    let v = find(p, SMP_HDR_BYTES, key)
+    if v.found and v.major == T_UINT
+        return v.arg
+    fallback
+
+// The text under `key` of the body, "" when there is none.
+@tier(app)
+pub fn text(p: Bytes, key: Str) -> Str
+    let v = find(p, SMP_HDR_BYTES, key)
+    if not v.found or v.major != T_TEXT
+        return ""
+    bytes.to_str(bytes.slice(p, v.at, v.at + v.arg))
+
+// The byte string under `key` of the body, empty when there is none.
+@tier(app)
+pub fn bytes_of(p: Bytes, key: Str) -> Bytes
+    let v = find(p, SMP_HDR_BYTES, key)
+    if not v.found or v.major != T_BYTES
+        return bytes.zeros(0)
+    bytes.slice(p, v.at, v.at + v.arg)
+
+// Whether the body holds a byte string under `key`.
+@tier(app)
+pub fn has_bytes(p: Bytes, key: Str) -> Bool
+    let v = find(p, SMP_HDR_BYTES, key)
+    v.found and v.major == T_BYTES
+
+// The code a response carries: the top-level `rc`, else the `rc` of the `err` map, else 0.
+@tier(app)
+pub fn rc_of(p: Bytes) -> Int
+    let top = uint(p, "rc", 0 - 1)
+    if top >= 0
+        return top
+    let e = find(p, SMP_HDR_BYTES, "err")
+    if e.found and e.major == T_MAP
+        let v = find(p, e.head, "rc")
+        if v.found and v.major == T_UINT
+            return v.arg
+    0
+
+// The unsigned number under `key` in the map that starts at `at`, or `fallback`.
+@tier(app)
+pub fn uint_in(p: Bytes, at: Int, key: Str, fallback: Int) -> Int
+    let v = find(p, at, key)
+    if v.found and v.major == T_UINT
+        return v.arg
+    fallback
+
+// The boolean under `key` in the map that starts at `at`, or `fallback`.
+@tier(app)
+pub fn bool_in(p: Bytes, at: Int, key: Str, fallback: Bool) -> Bool
+    let v = find(p, at, key)
+    if v.found and v.major == T_SIMPLE
+        if v.arg == 21
+            return true
+        if v.arg == 20
+            return false
+    fallback
+
+// The position after the item that starts at `at` of a packet that passed `valid`.
+@tier(app)
+pub fn after(p: Bytes, at: Int) -> Int
+    skip(p, at, 1)

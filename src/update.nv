@@ -9,7 +9,7 @@
 //   --serial [PORT]   the board's serial port, in the console framing of SMP.  Without a PORT the
 //                     serial ports of attached USB boards are listed, and the one there is, is used.
 //   --ble [ADDRESS]   the SMP service of a device over Bluetooth Low Energy, through a relay
-//                     program that has a Controller (noble-examples' pc/ble_smp.nv).  Without an
+//                     program that has a Controller (the program `ble_smp` of noble-examples).  Without an
 //                     ADDRESS the relay scans for devices that advertise the service, the devices
 //                     are listed, and the one there is, is used.
 //   --tcp HOST:PORT   a server on a socket, such as mcumgr-nv's host server.
@@ -60,7 +60,7 @@ pub struct Board
     data: Int
 
 // The version of the package, which `novo-update --version` prints; the release's smoke step reads it.
-pub const VERSION = "0.1.0"
+pub const VERSION = "0.1.1"
 
 // A serial port of a USB device, as the system describes it.
 pub struct Port

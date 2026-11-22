@@ -4,6 +4,7 @@
 use std.process
 use smpcli
 
+@tier(app)
 // cov: skip — the entry of the process: it runs when the binary does, and the suites call `smpcli.run` in its place
 fn main() [io, fs, net, mutate]
     process.exit(smpcli.run(env.user_args()))

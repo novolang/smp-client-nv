@@ -1,0 +1,439 @@
+// smpapi: the client half of SMP as a library, over a `Transport`.
+//
+// Each command sends a request, waits for the response that has the request's sequence number and answers what the response holds
+// as a value, a `Result` whose error is an `SmpError`.  Nothing is printed and no file is touched, so a phone app, a tool on a PC
+// and a Central on a board call the same functions and differ only in the transport they hand over (smptransport.nv: the console
+// framing over a wire, the packets as they are over a pipe; smpscript.nv: a script for a test; a program's own implementation of
+// the trait for the GATT client of a phone or of the noble Host).
+//
+//   let opt = smpapi.options(2000, 3)
+//   match smpapi.image_list(link, opt)
+//       Ok(slots) => ...
+//       Err(e)    => println(e.message())
+//
+// A request that is not answered within the timeout of `CallOptions` is sent again, up to `tries` times in all.  A packet that is no
+// response (a header the protocol does not define, a length that is not the packet's, a body that is not a whole map) or whose
+// sequence number is another is passed over, and a request that got only such packets is `E_BAD_ANSWER` when one had its number
+// and `E_NO_ANSWER` when none had.  The commands of a group the server does not have come back as the server's code, `ENOTSUP`.
+//
+// The buffer a request is built in, and its numbering, belong to the package: one request is in flight in a process at a time.
+// The size of a request is bounded by `smp_buf_bytes` of mcumgr-nv's configuration, 512 by default, and by the transport's `mtu`;
+// a response may be of any size the transport delivers.
+
+use std.bytes
+use smphdr
+use smpreq
+use smpbody
+use smppack
+use smptransport
+
+// No response arrived within the tries.
+pub const E_NO_ANSWER = 0 - 1
+
+// The transport refused the request.
+pub const E_SEND = 0 - 10
+
+// A response had the number of the request and was no whole response, or lacked what its command returns.
+pub const E_BAD_ANSWER = 0 - 11
+
+// After an upload the server holds no image with the hash the file carries.
+pub const E_HASH = 0 - 12
+
+// The progress callback answered false, and the transfer stopped.
+pub const E_CANCELLED = 0 - 13
+
+// An error of a command: a code of the server (0 is success, so it is 1 to 11 and above), or one of the `E_` codes above.
+pub struct SmpError
+    code: Int
+
+impl Error for SmpError
+    @tier(app)
+    fn message(self) -> Str
+        if self.code == E_NO_ANSWER
+            return "the server gave no answer"
+        if self.code == E_SEND
+            return "the transport could not send the request"
+        if self.code == E_BAD_ANSWER
+            return "the server's answer is malformed"
+        if self.code == E_HASH
+            return "the server holds no image with the hash of the uploaded file"
+        if self.code == E_CANCELLED
+            return "the transfer was stopped"
+        "the server answered code ${self.code} (${code_name(self.code)})"
+
+// The name of a code the server answers.
+@tier(app)
+pub fn code_name(code: Int) -> Str
+    if code == EUNKNOWN
+        return "unknown error"
+    if code == ENOMEM
+        return "no memory"
+    if code == EINVAL
+        return "invalid request"
+    if code == ETIMEOUT
+        return "timeout"
+    if code == ENOENT
+        return "no such entry"
+    if code == EBADSTATE
+        return "bad state"
+    if code == EMSGSIZE
+        return "message too large"
+    if code == ENOTSUP
+        return "not supported"
+    if code == ECORRUPT
+        return "corrupt"
+    if code == EBUSY
+        return "busy"
+    if code == EACCESSDENIED
+        return "access denied"
+    "code of the server"
+
+// How a command waits and how an upload is cut into requests.  `ms` is the time to wait for a response, `tries` the number of
+// times a request is sent, and `chunk` the most bytes of a file in one request, 0 for the most the buffer and the transport allow.
+pub @value
+struct CallOptions
+    ms: Int
+    tries: Int
+    chunk: Int
+
+// CallOptions that wait `ms` milliseconds for each of `tries` attempts and cut a file as large as the buffer and the transport allow.
+@tier(app)
+pub fn options(ms: Int, tries: Int) -> CallOptions
+    CallOptions { ms: ms, tries: tries, chunk: 0 }
+
+// `o` with a chunk of at most `chunk` bytes.
+@tier(app)
+pub fn with_chunk(o: CallOptions, chunk: Int) -> CallOptions
+    CallOptions { ms: o.ms, tries: o.tries, chunk: chunk }
+
+// What a transfer tells its caller as it goes: `step` runs after each response, with the bytes done and the bytes in all (the
+// total of a download is what the server stated, 0 until the first response), and answers whether to go on.  False stops the
+// transfer with `E_CANCELLED`; the server keeps what it has, and an upload started again continues from there.
+pub trait Progress[e]
+    fn step(self, done: Int, total: Int) -> Bool [e]
+
+// A progress that watches nothing and never stops a transfer.
+pub struct Silent
+    id: Int
+
+impl Progress[mutate] for Silent
+    @tier(app)
+    fn step(self, done: Int, total: Int) -> Bool [mutate]
+        true
+
+// The slot of an image the server lists.
+pub struct Slot
+    image: Int
+    slot: Int
+    version: Str
+    hash: Bytes
+    bootable: Bool
+    active: Bool
+    confirmed: Bool
+    pending: Bool
+    permanent: Bool
+
+// What `params` answers: the largest packet the server takes and how many it holds.
+pub @value
+struct Params
+    buf_size: Int
+    buf_count: Int
+
+// What an upload did: the requests it sent and the offset the server answered to the first, which is above the first chunk when the
+// server held the start of the file already.
+pub @value
+struct Upload
+    requests: Int
+    resumed_at: Int
+
+// What `fs_hash` answers: the CRC-32 of the file and the bytes it covers.
+pub @value
+struct FileHash
+    crc32: Int
+    len: Int
+
+var req: SmpBuf = Vec.new()
+var seq         = 0
+var last: Bytes = bytes.zeros(0)
+
+@tier(app)
+fn next_seq() -> Int [mutate]
+    seq = (seq + 1) & 0xFF
+    seq
+
+@tier(app)
+fn fail(code: Int) -> SmpError
+    SmpError { code: code }
+
+// The first `n` bytes of `req`.
+@tier(app)
+fn packet_of_req(n: Int) -> Bytes [mutate]
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, req[i] as Int)
+    bytes.from_byte_list(out)
+
+// Sends the request of `n` bytes in `req` and keeps its response in `last`.  Answers 0, `E_SEND`, `E_BAD_ANSWER` or `E_NO_ANSWER`.
+@tier(app)
+fn exchange<T: Transport[e]>(t: T, n: Int, o: CallOptions) -> Int [e, mutate]
+    let want = req[6] as Int
+    var damaged = false
+    for _t in 0..o.tries
+        if not t.send(packet_of_req(n))
+            return E_SEND
+        for _b in 0..200000
+            match t.recv(o.ms)
+                None    => break
+                Some(p) =>
+                    if smpbody.seq_of(p) == want
+                        if smpbody.valid(p)
+                            last = bytes.clone(p)
+                            return 0
+                        damaged = true
+    if damaged
+        return E_BAD_ANSWER
+    E_NO_ANSWER
+
+// The code of the exchange of the request of `n` bytes: the transport's, or the server's.  0 when the response holds no error.
+@tier(app)
+fn code_of<T: Transport[e]>(t: T, n: Int, o: CallOptions) -> Int [e, mutate]
+    let x = exchange(t, n, o)
+    if x != 0
+        return x
+    smpbody.rc_of(last)
+
+// A command whose answer carries nothing but its code.
+@tier(app)
+fn plain_result<T: Transport[e]>(t: T, n: Int, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
+    let rc = code_of(t, n, o)
+    if rc != 0
+        return Err(fail(rc))
+    Ok()
+
+// The most bytes of a file one request carries: what the buffer holds after the header and the keys of the largest request, less
+// what the transport's limit holds back.  `want` is the caller's chunk, 0 for the most.
+@tier(app)
+fn chunk_of<T: Transport[e]>(t: T, want: Int) -> Int [e, mutate]
+    var room = req.capacity() - 96
+    let limit = t.mtu()
+    if limit > 0 and limit - 96 < room
+        room = limit - 96
+    if room < 1
+        room = 1
+    if want > 0 and want < room
+        return want
+    room
+
+// The answer of `echo`: the text the server sent back.
+@tier(app)
+pub fn echo<T: Transport[e]>(t: T, text: Str, o: CallOptions) -> Result<Str, SmpError> [e, mutate]
+    let rc = code_of(t, smpreq.echo(var req, next_seq(), 0, text), o)
+    if rc != 0
+        return Err(fail(rc))
+    Ok(smpbody.text(last, "r"))
+
+// The buffer the server reads a packet into, and how many of them it has.
+@tier(app)
+pub fn params<T: Transport[e]>(t: T, o: CallOptions) -> Result<Params, SmpError> [e, mutate]
+    let rc = code_of(t, smpreq.params(var req, next_seq(), 0), o)
+    if rc != 0
+        return Err(fail(rc))
+    Ok(Params { buf_size: smpbody.uint(last, "buf_size", 0), buf_count: smpbody.uint(last, "buf_count", 0) })
+
+// Asks the server to reset.  The server answers first and resets after it.
+@tier(app)
+pub fn reset<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
+    plain_result(t, smpreq.reset(var req, next_seq(), 0), o)
+
+// The images in the response held in `last`: none when the response has no `images`, which a server with no image may leave out.
+// None when `images` is not an array.
+@tier(app)
+fn slots_of_last() -> ?[Slot]
+    let f = smpbody.find(last, SMP_HDR_BYTES, "images")
+    if not f.found
+        return Some([])
+    if f.major != smpbody.T_ARRAY
+        return None
+    var out: [Slot] = []
+    var at = f.at
+    for _k in 0..f.arg
+        let v = smpbody.find(last, at, "version")
+        let h = smpbody.find(last, at, "hash")
+        let end = smpbody.after(last, at)
+        var version = ""
+        if v.found and v.major == smpbody.T_TEXT
+            version = bytes.to_str(bytes.slice(last, v.at, v.at + v.arg))
+        var digest = bytes.zeros(0)
+        if h.found and h.major == smpbody.T_BYTES
+            digest = bytes.slice(last, h.at, h.at + h.arg)
+        list.push(out, Slot {
+            image: smpbody.uint_in(last, at, "image", 0), slot: smpbody.uint_in(last, at, "slot", 0), version: version, hash: digest,
+            bootable: smpbody.bool_in(last, at, "bootable", false), active: smpbody.bool_in(last, at, "active", false),
+            confirmed: smpbody.bool_in(last, at, "confirmed", false), pending: smpbody.bool_in(last, at, "pending", false),
+            permanent: smpbody.bool_in(last, at, "permanent", false) })
+        at = end
+    Some(out)
+
+// The result of a command that answers the image list.
+@tier(app)
+fn slots_result<T: Transport[e]>(t: T, n: Int, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
+    let rc = code_of(t, n, o)
+    if rc != 0
+        return Err(fail(rc))
+    match slots_of_last()
+        None        => Err(fail(E_BAD_ANSWER))
+        Some(slots) => Ok(slots)
+
+// The images the server holds.
+@tier(app)
+pub fn image_list<T: Transport[e]>(t: T, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
+    slots_result(t, smpreq.image_list(var req, next_seq(), 0), o)
+
+// Marks the image whose hash is `hash` to run on trial at the next start, and answers the list the server then holds.
+@tier(app)
+pub fn image_test<T: Transport[e]>(t: T, hash: Bytes, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
+    slots_result(t, smpreq.image_state(var req, next_seq(), 0, hash, false), o)
+
+// Confirms the image that runs, or, with the hash of the staged image, makes that one permanent.  `hash` empty confirms the
+// image that runs.
+@tier(app)
+pub fn image_confirm<T: Transport[e]>(t: T, hash: Bytes, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
+    slots_result(t, smpreq.image_state(var req, next_seq(), 0, hash, true), o)
+
+// Erases the second slot.
+@tier(app)
+pub fn image_erase<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
+    plain_result(t, smpreq.image_erase(var req, next_seq(), 0), o)
+
+// The hash an image carries, which the server lists once the image is staged: the 32 bytes at 0x20 of a NOVB image, or of the NOVB
+// image a package wraps.  Empty for a file that is neither, such as an image of another format, whose hash the client does not read.
+@tier(app)
+pub fn expected_hash(file: Bytes) -> Bytes
+    let img = smppack.unwrap(file)
+    if bytes.len(img) < 0x40
+        return bytes.zeros(0)
+    if (bytes.byte_at(img, 0) ?? 0) != 'N' or (bytes.byte_at(img, 1) ?? 0) != 'O' or (bytes.byte_at(img, 2) ?? 0) != 'V'
+       or (bytes.byte_at(img, 3) ?? 0) != 'B'
+        return bytes.zeros(0)
+    bytes.slice(img, 0x20, 0x40)
+
+// Uploads `file` as the image `image` (0 is the firmware, 1 the data region), a request at a time.  The server answers the offset
+// it expects next, and the upload goes on from there; so a first request that is answered with an offset above zero resumes an
+// upload an earlier call left, whatever the call.  `p` is told after each response.  The first request of a NOVB image or a
+// package carries the image's hash.  Nothing is checked after the last request: `image_upload` is the call that does.
+@tier(app)
+pub fn image_upload_to<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: Bytes, o: CallOptions, p: P) -> Result<Upload, SmpError> [e, f, mutate]
+    let total = bytes.len(file)
+    var sha = bytes.zeros(0)
+    if image == 0
+        sha = expected_hash(file)
+    var off = 0
+    var sent = 0
+    var resumed = 0
+    for _r in 0..total + 16
+        if off < total
+            var n = total - off
+            let room = chunk_of(t, o.chunk)
+            if n > room
+                n = room
+            let rc = code_of(t, smpreq.image_upload_to(var req, next_seq(), 0, image, file, off, n, sha, false), o)
+            if rc != 0
+                return Err(fail(rc))
+            sent = sent + 1
+            let at = smpbody.uint(last, "off", off + n)
+            if at > total
+                return Err(fail(E_BAD_ANSWER))
+            if sent == 1 and at > n
+                resumed = at
+            off = at
+            if not p.step(off, total) and off < total
+                return Err(fail(E_CANCELLED))
+    Ok(Upload { requests: sent, resumed_at: resumed })
+
+// `image_upload_to` for the firmware, then a check that the server holds the image: its list must have an image whose hash is the
+// one the file carries.  A file with no hash to read (`expected_hash`) is not checked.  `E_HASH` when no listed image has it.
+@tier(app)
+pub fn image_upload<T: Transport[e], P: Progress[f]>(t: T, file: Bytes, o: CallOptions, p: P) -> Result<Upload, SmpError> [e, f, mutate]
+    match image_upload_to(t, 0, file, o, p)
+        Err(e) => Err(e)
+        Ok(u)  =>
+            let want = bytes.to_hex(expected_hash(file))
+            if want == ""
+                return Ok(u)
+            match image_list(t, o)
+                Err(e)      => Err(e)
+                Ok(slots)   =>
+                    for s in slots
+                        if bytes.to_hex(s.hash) == want
+                            return Ok(u)
+                    Err(fail(E_HASH))
+
+// Uploads `file` as the file `name` of the server's volume.  The server gathers the file in memory and writes it when the last
+// chunk has arrived, so a transfer that stopped starts again from the first byte.
+@tier(app)
+pub fn fs_upload<T: Transport[e], P: Progress[f]>(t: T, name: Str, file: Bytes, o: CallOptions, p: P) -> Result<Unit, SmpError> [e, f, mutate]
+    let total = bytes.len(file)
+    var off = 0
+    for _r in 0..total + 16
+        if off < total or (total == 0 and off == 0)
+            var n = total - off
+            let room = chunk_of(t, o.chunk) - str.len(name)
+            if n > room
+                n = room
+            let rc = code_of(t, smpreq.fs_upload(var req, next_seq(), 0, name, file, off, n), o)
+            if rc != 0
+                return Err(fail(rc))
+            if total == 0
+                return Ok()
+            let at = smpbody.uint(last, "off", off + n)
+            if at > total
+                return Err(fail(E_BAD_ANSWER))
+            off = at
+            if not p.step(off, total) and off < total
+                return Err(fail(E_CANCELLED))
+    Ok()
+
+// The length of the file `name`.
+@tier(app)
+pub fn fs_status<T: Transport[e]>(t: T, name: Str, o: CallOptions) -> Result<Int, SmpError> [e, mutate]
+    let rc = code_of(t, smpreq.fs_status(var req, next_seq(), 0, name), o)
+    if rc != 0
+        return Err(fail(rc))
+    Ok(smpbody.uint(last, "len", 0))
+
+// The CRC-32 of the file `name`.
+@tier(app)
+pub fn fs_hash<T: Transport[e]>(t: T, name: Str, o: CallOptions) -> Result<FileHash, SmpError> [e, mutate]
+    let rc = code_of(t, smpreq.fs_hash(var req, next_seq(), 0, name, "crc32", 0, 0 - 1), o)
+    if rc != 0
+        return Err(fail(rc))
+    Ok(FileHash { crc32: smpbody.uint(last, "output", 0), len: smpbody.uint(last, "len", 0) })
+
+// Asks the server to close the files of a transfer that stalled.
+@tier(app)
+pub fn fs_close<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
+    plain_result(t, smpreq.fs_close(var req, next_seq(), 0), o)
+
+// Downloads the file `name`.  The first response states the length; the requests go on until the bytes are all there.
+@tier(app)
+pub fn fs_download<T: Transport[e], P: Progress[f]>(t: T, name: Str, o: CallOptions, p: P) -> Result<Bytes, SmpError> [e, f, mutate]
+    var all: [Int] = []
+    var off = 0
+    var total = 0 - 1
+    for _r in 0..100000
+        if total < 0 or off < total
+            let rc = code_of(t, smpreq.fs_download(var req, next_seq(), 0, name, off), o)
+            if rc != 0
+                return Err(fail(rc))
+            total = smpbody.uint(last, "len", 0)
+            if not smpbody.has_bytes(last, "data")
+                return Err(fail(E_BAD_ANSWER))
+            let d = smpbody.bytes_of(last, "data")
+            for i in 0..bytes.len(d)
+                list.push(all, bytes.byte_at(d, i) ?? 0)
+            off = off + bytes.len(d)
+            if not p.step(off, total) and off < total
+                return Err(fail(E_CANCELLED))
+            if bytes.len(d) == 0
+                break
+    Ok(bytes.from_byte_list(all))

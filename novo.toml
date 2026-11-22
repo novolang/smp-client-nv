@@ -1,7 +1,7 @@
 [package]
 name        = "smp-client-nv"
-version     = "0.1.0"
-description = "The client half of SMP, the Simple Management Protocol of MCUmgr, for a host: a Transport trait with the console framing over a serial port, a pty or a TCP socket and the packets as they are over a pipe, the commands of the OS, image and file groups, and two programs: smp-client-nv, which also packs the file nRF Connect Device Manager reads, and novo-update, which the toolchain runs as `novo update` to update a board and write its data region."
+version     = "0.1.1"
+description = "The client half of SMP, the Simple Management Protocol of MCUmgr: a library whose commands of the OS, image and file groups return values, with upload, resume and progress, over a Transport trait that has the console framing over a serial port, a pty or a TCP socket, the packets as they are over a pipe and a script for tests, and a program may implement for another link such as Bluetooth Low Energy; and two programs: smp-client-nv, which also packs the file nRF Connect Device Manager reads, and novo-update, which the toolchain runs as `novo update` to update a board and write its data region."
 license     = "Apache-2.0"
 stability   = "experimental"
 

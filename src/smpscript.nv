@@ -1,0 +1,140 @@
+// smpscript: a Transport whose far end is a script.
+//
+// A program that speaks SMP through a `Transport` tests its error paths against a `Scripted` one: the test queues the packets the
+// device would send, in order, and reads back the packets the program sent.  Nothing is opened and no time passes, so a lost
+// answer, a late answer, an answer for another request, a cut packet and a link that refuses a write are lines of a test.
+//
+//   let dev = smpscript.scripted()
+//   dev.answer(canned_image_list)      // the next `recv` after a `send` delivers this packet
+//   dev.silence()                      // the one after it times out
+//   dev.answer_raw(stale_packet)       // delivered as it is, with the sequence number it has
+//   let r = smpapi.image_list(dev, smpapi.options(100, 2))
+//
+// An answer queued with `answer` takes the sequence number of the request sent last, which a canned packet cannot know: the client
+// numbers its requests and ignores an answer whose number is another.  `answer_raw` keeps the packet as it is.  A `recv` with no
+// step left times out.  The packets are `Bytes`; `packet_of` makes one from a buffer a test filled with the builders of mcumgr-nv.
+
+use std.bytes
+use smphdr
+use smptransport
+
+// A step of the script is an answer that takes the number of the last request.
+const STAMPED = 0
+
+// A step that is delivered as it is.
+const RAW = 1
+
+// A step that is a timeout.
+const SILENT = 2
+
+// One step: what kind it is and the packet it delivers.
+struct Step
+    kind: Int
+    data: Bytes
+
+// What the script keeps: the steps to come, the packets sent so far, the step to deliver next, the writes the link will still
+// refuse and the limit it reports.  A struct is a reference, so the methods of `Scripted`, whose receiver is by value, move this
+// one through a local `var` name.
+struct State
+    var steps: [Step]
+    var sent: [Bytes]
+    var at: Int
+    var refuse: Int
+    var limit: Int
+
+// The device of a test.
+pub struct Scripted
+    st: State
+
+// A script with no steps, that accepts every write and reports no limit.
+@tier(app)
+pub fn scripted() -> Scripted
+    Scripted { st: State { steps: [], sent: [], at: 0, refuse: 0, limit: 0 } }
+
+// The first `n` bytes of `b`, as a packet.
+@tier(app)
+pub fn packet_of(var b: SmpBuf, n: Int) -> Bytes [mutate]
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, b[i] as Int)
+    bytes.from_byte_list(out)
+
+// `p` with the sequence number `seq` in its header.
+@tier(app)
+fn stamped(p: Bytes, seq: Int) -> Bytes
+    if bytes.len(p) < SMP_HDR_BYTES
+        return bytes.clone(p)
+    bytes.slice(p, 0, 6) + bytes.from_byte_list([seq]) + bytes.slice(p, 7, bytes.len(p))
+
+impl Scripted
+    // Queues an answer that takes the sequence number of the request sent last.
+    @tier(app)
+    fn answer(self, packet: Bytes) [mutate]
+        var st = self.st
+        list.push(st.steps, Step { kind: STAMPED, data: bytes.clone(packet) })
+
+    // Queues a packet that is delivered as it is.
+    @tier(app)
+    fn answer_raw(self, packet: Bytes) [mutate]
+        var st = self.st
+        list.push(st.steps, Step { kind: RAW, data: bytes.clone(packet) })
+
+    // Queues a wait that ends with no packet: the `recv` that reaches it answers None.
+    @tier(app)
+    fn silence(self) [mutate]
+        var st = self.st
+        list.push(st.steps, Step { kind: SILENT, data: bytes.zeros(0) })
+
+    // The next `n` writes are refused.
+    @tier(app)
+    fn refuse_sends(self, n: Int) [mutate]
+        var st = self.st
+        st.refuse = n
+
+    // The limit `mtu` reports; 0 for none.
+    @tier(app)
+    fn set_limit(self, n: Int) [mutate]
+        var st = self.st
+        st.limit = n
+
+    // The number of packets sent so far.
+    @tier(app)
+    fn requests(self) -> Int
+        self.st.sent.len()
+
+    // The packet sent as the `i`th, counted from 0.
+    @tier(app)
+    fn request(self, i: Int) -> Bytes
+        bytes.clone(self.st.sent[i])
+
+    // The number of steps not yet delivered.
+    @tier(app)
+    fn pending(self) -> Int
+        self.st.steps.len() - self.st.at
+
+impl Transport[mutate] for Scripted
+    @tier(app)
+    fn send(self, packet: Bytes) -> Bool [mutate]
+        var st = self.st
+        if st.refuse > 0
+            st.refuse = st.refuse - 1
+            return false
+        list.push(st.sent, bytes.clone(packet))
+        true
+
+    @tier(app)
+    fn recv(self, ms: Int) -> ?Bytes [mutate]
+        var st = self.st
+        if st.at >= st.steps.len()
+            return None
+        let s = st.steps[st.at]
+        st.at = st.at + 1
+        if s.kind == SILENT
+            return None
+        if s.kind == RAW or st.sent.len() == 0
+            return Some(bytes.clone(s.data))
+        Some(stamped(s.data, bytes.byte_at(st.sent[st.sent.len() - 1], 6) ?? 0))
+
+    @tier(app)
+    fn mtu(self) -> Int
+        self.st.limit

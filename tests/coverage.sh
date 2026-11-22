@@ -4,14 +4,14 @@
 #
 # `novo test --cov` measures one suite file at a time, and a suite's
 # percentage counts the suite's own lines as well as the package's.  No
-# single number it prints is the one `docs/publishing.md`
-# § Test coverage asks for.  This merges the per-suite LCOV and reports
+# single number it prints is the one the publishing page of the
+# novo-lang documentation (Test coverage) asks for.  This merges the per-suite LCOV and reports
 # this package's own `src/` alone, which is what a release is measured
 # on; a dependency's sources, compiled in beside it, are left out.
 #
 # A line under a `// cov: skip — <reason>` marker is excused, together
 # with the lines indented beneath it: the marker sits directly above the
-# region it names, as docs/publishing.md § Test coverage describes.  A
+# region it names, as that page describes.  A
 # marker over a line that is in fact covered fails the run.
 #
 # Pass --list to print every uncovered line's source text.
