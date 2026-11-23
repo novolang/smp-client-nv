@@ -240,6 +240,56 @@ implementations of `GattCentral` that this module runs on; neither is in this pa
 that is not confirmed is reverted), reached as a `GattCentral` over the double of ble-central-nv (`periph()`), whose next response a test splits,
 loses, doubles or holds back and whose link a test cuts.  A program that speaks SMP tests its flow against it with no radio and no board.
 
+## The upgrade flow
+
+`smpflow` is the upgrade of a device that runs novoboot and the SMP service, as a state machine over a `Transport` that is also a `Reopen`.  It
+is the flow of `novo update --test --confirm` written once for a program on a PC, an application on a phone and a suite: it reads the image list,
+checks the candidate, uploads with progress, marks the image, restarts the device, waits for it to come back, reads the list again and confirms.
+
+```novo ignore
+match smpflow.candidate(file)
+    None    => println("not an image")
+    Some(c) =>
+        let record = smpflow.new_state(c, smpflow.Mode.TestAndConfirm)
+        let plan = smpflow.plan(smpflow.Mode.TestAndConfirm, smpapi.options(10000, 3))
+        let report = smpflow.run(link, file, plan, record, progress, journal, smpflow.System { id: 0 })
+        println(report.why)
+```
+
+Every step ends in a read of the list, and the next step is derived from what the device says, so a link that dropped, a process that was killed and a
+device that restarted resume the same way.  `decide(slots, candidate, mode, reset_sent)` is that derivation:
+
+| The device's list | The next step |
+| --- | --- |
+| the running image is the candidate and is confirmed (or the mode leaves it on trial) | `Done` |
+| the running image is the candidate and is not confirmed | `Confirm` |
+| a restart was asked for, the candidate is in the other slot and pending | `Hold`: the device has not restarted yet |
+| a restart was asked for and the candidate is nowhere, or is not pending | `Reverted`: the bootloader reverted it |
+| the candidate is in the other slot and pending | `Reset` |
+| the candidate is in the other slot, not pending | `Mark`: `image test`, or `image confirm HASH` in the mode that makes it permanent |
+| the candidate is nowhere | `Upload`, which resumes from the offset the device kept |
+
+A restart is the one fact the list cannot show, since a candidate that failed its trial is not listed and the device then looks like one that was never
+given the image.  The flow holds it in the `FlowState` record, which `state_text` writes as four lines and `state_parse` reads, and which `run` hands to a
+`Journal` at each step, so a program that is killed after the restart keeps it.  A record of another image or another mode is started again.
+
+The modes: `TestAndConfirm` marks the image for a trial and confirms it once it runs; `ConfirmOnly` stages it as permanent, with no trial; `TestOnly` leaves
+it on trial, which the bootloader reverts at the next start unless the application confirms it.  The `Plan` says how long a command waits and how often
+it is tried, how long the device may be away after the reset (two minutes), how long a link that dropped is tried again (half a minute, with pauses that
+double from half a second to four), the size of the second slot, whether a version that is not above the running one is refused, and how often a command
+that failed with the link up is tried again.
+
+A `Report` says how the run ended (`Done`, `AlreadyInstalled`, `Reverted`, `NeverReturned`, `Refused`, `Cancelled`, `LinkLost`, `Failed`), the step it ended
+in, the code and the sentence of the failure, the versions, the upload requests and the offset a resumed upload went on from, the links made again, the
+time, and the log.  A candidate is refused before anything is sent when it is no NOVB image or package, when it is larger than the slot the plan states
+or when the plan asks for a newer version and it is not.  The flow takes its time from a `Clock`: `System` is the machine's, and `Manual` is a clock a test
+moves, so a wait of two minutes takes no time.
+
+`smpdirect` is the device of `smpdevice` as a `Transport` and a `Reopen` in the same process, cut at a request of a suite's choice; `tests/flow_tests.nv`
+runs the flow against it, and `tests/proof_tests.nv` runs it over `smpgatt` and the double of ble-central-nv against the same device: the flow, the
+transport, the reassembly, the server's image group, the slot writer and the start-up rule are the real code, and the radio, the ATT bearer and a phone's
+Bluetooth stack are the model.
+
 ## What the package contains
 
 | Module | Contents |
@@ -250,6 +300,8 @@ loses, doubles or holds back and whose link a test cuts.  A program that speaks 
 | `smpscript` | `Scripted`, the transport of a test. |
 | `smpgatt` | `GattLink`, the `Transport` over a `GattCentral`: `open`, `attach`, `reopen`, the UUIDs of the SMP service. |
 | `smpdevice` | A device for a suite: the server of mcumgr-nv over RAM slots with novoboot's start-up rule, as a `GattCentral` (`periph`). |
+| `smpdirect` | The same device as a `Transport` and a `Reopen` in the same process (`direct`), cut at a request. |
+| `smpflow` | The upgrade as a state machine: `candidate`, `plan`, `decide`, `run`, the `FlowState` record, `Journal`, `Clock`, `Report`. |
 | `smpclient` | The commands that print: the library's calls with the lines `smp-client-nv` writes, and a code in place of a `Result`. |
 | `smpcli` | The commands of the `smp-client-nv` program, and the exit status. |
 | `update` | `novo update`: the command line, the board's flash table as the toolchain prints it, the listing of serial ports and of devices, and the upload with its trial, restart and confirmation. |
@@ -335,6 +387,8 @@ one on PATH, with the socket of the bridge in front of the Controller
 
 ## Limits
 
+- `novo update` does not call `smpflow`: it opens its link again for each step and its suite fixes the steps it prints.  The flow is for a program
+  that holds one transport that it can open again.
 - One request is in flight in a process.  The buffer a request is built in and
   its sequence numbers belong to the package, so two threads must not call it at
   the same time.
@@ -383,6 +437,8 @@ bash tests/coverage.sh
 novo test tests/api_tests.nv        # 16: the library against a script (codes, a lost answer, an answer of another request, a cut packet, a hash that differs, resume, progress) and against the server in the same process
 novo test tests/client_tests.nv     # 16: the commands against a server in the same process, a socket, a pipe, a descriptor, a serial port
 novo test tests/gatt_tests.nv       # 18: the transport over a Central against the server in the same process (every command, writes of 20, 185 and 244 bytes, a response cut at every boundary, a lost, a doubled and a late piece, a link dropped in the middle of an upload and resumed)
+novo test tests/flow_tests.nv       # 21: the table of the stages, the record, the clocks, the flow to its end in each mode, cut at every request, reverted, stopped, refused and left with a device that never returns
+novo test tests/proof_tests.nv      #  8: the flow over the GATT transport against the real server (writes of 20, 185 and 244 bytes, a link dropped after each of 60 writes, a late upload cut, a hung image, a device off the air, a lost piece)
 novo test tests/transport_tests.nv  #  4: a packet across a pipe, the framing and the pieces of a write, the opening of a serial port
 novo test tests/update_tests.nv     # 21: the command line, the board, the listing, the flow of an update
 novo test tests/volume_tests.nv     #  1: a data image into the data region and the files of its volume

@@ -17,7 +17,16 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 - `smpdevice`: the server of mcumgr-nv over RAM slots with novoboot's start-up rule, for the suites of a program that speaks SMP, as a `GattCentral`
   over the double of ble-central-nv whose responses a test splits, loses, doubles and holds back and whose link a test cuts.
 - A dependency on ble-central-nv ^0.1.0, written as a path to the novo-lang tree until that package is published; the line is `"^0.1.0"` at publish.
-- `tests/gatt_tests.nv`, 18 tests.
+- `smpflow`: the upgrade of a device that runs novoboot and the SMP service as a state machine over a `Transport` that is also a `Reopen`.  `run` reads the
+  image list, checks the candidate (not an image, larger than the slot the plan states, not newer when the plan asks), uploads with progress and resume,
+  marks the image (`image test`, or `image confirm HASH` for a permanent image), restarts the device, waits for it with growing pauses, reads the list
+  again and confirms, and makes the link again when it dropped.  `decide` is the table of the stages: the next step comes from the list and from the one fact
+  the list cannot show, whether a restart was asked for, which `FlowState` holds (`new_state`, `state_text`, `state_parse`, `Journal`).  `Mode`
+  (`TestAndConfirm`, `ConfirmOnly`, `TestOnly`), `Plan`, `Report` and `Outcome` (`Done`, `AlreadyInstalled`, `Reverted`, `NeverReturned`, `Refused`, `Cancelled`,
+  `LinkLost`, `Failed`).  `Clock` with `System` and `Manual`.
+- `smpdirect`: the device of `smpdevice` as a `Transport` and a `Reopen` in the same process, cut at a request.
+- `tests/gatt_tests.nv`, 18 tests; `tests/flow_tests.nv`, 21 tests; `tests/proof_tests.nv`, 8 tests, the flow over `smpgatt` against the real server of mcumgr-nv.
+- `tests/update_tests.nv` no longer imports `std.env`, which it did not use.
 
 ## 0.1.1 — 2026-11-22
 

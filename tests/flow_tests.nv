@@ -1,0 +1,664 @@
+// flow_tests: the upgrade flow against a device that keeps its slots and restarts.
+//
+//   novo test tests/flow_tests.nv
+//
+// The device is the server of mcumgr-nv over RAM slots with novoboot's start-up rule (smpdevice.nv), reached in the same process
+// (smpdirect.nv); the clock is a manual one, so a wait of two minutes takes no time.  The table of the stages is checked on lists
+// that a test writes, and the flow is run to its end, cut at every request, reverted, and left with a device that never returns.
+
+use std.test
+use std.bytes
+use smpdevice
+use smpdirect
+use smpflow
+use smpapi
+use smphdr
+use smppack
+use smptransport
+
+let V1 = 0x01000000
+let V2 = 0x02000000
+
+fn call_opts() -> CallOptions
+    smpapi.options(50, 2)
+
+fn silent() -> Silent
+    Silent { id: 0 }
+
+fn quiet() -> Quiet
+    Quiet { id: 0 }
+
+fn image(n: Int, salt: Int) -> Bytes
+    smpdevice.image_of(V2, n, salt)
+
+fn hex_of(img: Bytes) -> Str
+    bytes.to_hex(smpapi.expected_hash(img))
+
+// The record of the upgrade to `img`.
+fn record_of(img: Bytes, mode: Mode) -> FlowState
+    match smpflow.candidate(img)
+        Some(c) => smpflow.new_state(c, mode)
+        None    => FlowState { hash: "", mode: 0, stage: 0, reset_sent: false }
+
+// Runs the flow to `img` over `t` with the default plan of `mode`.
+fn go<T: Transport[e] + Reopen[f]>(t: T, img: Bytes, mode: Mode,
+                                   clk: Manual) -> Report [e, f, mutate, time]
+    smpflow.run(t, img, smpflow.plan(mode, call_opts()), record_of(img, mode), silent(), quiet(), clk)
+
+// A device with version 1.0.0 confirmed, and the image 2.0.0 for it.
+fn fresh() -> Bytes [mutate]
+    smpdevice.fresh(V1)
+    image(1500, 3)
+
+// What the journal was told: the records and the lines.
+struct Tape
+    var records: [Str]
+    var lines: [Str]
+
+struct Writer
+    tape: Tape
+
+impl Journal[mutate] for Writer
+    fn record(self, st: FlowState, line: Str) [mutate]
+        var t = self.tape
+        list.push(t.records, smpflow.state_text(st))
+        list.push(t.lines, line)
+
+fn writer() -> Writer
+    Writer { tape: Tape { records: [], lines: [] } }
+
+// A progress that stops the transfer after `after` responses.
+struct Gate
+    st: GateState
+
+struct GateState
+    var left: Int
+
+impl Progress[mutate] for Gate
+    fn step(self, done: Int, total: Int) -> Bool [mutate]
+        var st = self.st
+        st.left = st.left - 1
+        st.left > 0
+
+fn gate(after: Int) -> Gate
+    Gate { st: GateState { left: after } }
+
+fn slot(active: Bool, confirmed: Bool, pending: Bool, digest: Bytes) -> Slot
+    Slot { image: 0,
+        slot: (if active then 0 else 1),
+        version: "1.0.0",
+        hash: digest,
+        bootable: true,
+        active: active,
+        confirmed: confirmed,
+        pending: pending,
+        permanent: false }
+
+fn candidate_of(img: Bytes) -> Candidate
+    match smpflow.candidate(img)
+        Some(c) => c
+        None    => Candidate { hash: bytes.zeros(0), hex: "", version: "", number: 0, size: 0 }
+
+@test
+fn test_the_table_of_the_stages_names_the_next_step() [io, fs, net, mutate, time]
+    let img = image(300, 1)
+    let c = candidate_of(img)
+    let old = smpdevice.payload(32, 9)
+    let mine = c.hash
+    let modes = [Mode.TestAndConfirm, Mode.ConfirmOnly, Mode.TestOnly]
+
+    test.case("the candidate runs and is confirmed")
+    for m in modes
+        test.assert(smpflow.decide([slot(true, true, false, mine)], c, m, false) == Action.Done)
+        test.assert(smpflow.decide([slot(true, true, false, mine), slot(false, true, false, old)], c, m, true) == Action.Done)
+
+    test.case("the candidate runs on trial: confirm it, unless the mode leaves it on trial")
+    test.assert(smpflow.decide([slot(true, false, false, mine)], c, Mode.TestAndConfirm, true) == Action.Confirm)
+    test.assert(smpflow.decide([slot(true, false, false, mine)], c, Mode.ConfirmOnly, true) == Action.Confirm)
+    test.assert(smpflow.decide([slot(true, false, false, mine)], c, Mode.TestOnly, true) == Action.Done)
+
+    test.case("the candidate waits in the other slot")
+    for m in modes
+        test.assert(smpflow.decide([slot(true, true, false, old), slot(false, false, true, mine)], c, m, false) == Action.Reset)
+        test.assert(smpflow.decide([slot(true, true, false, old), slot(false, false, false, mine)], c, m, false) == Action.Mark)
+        test.assert(smpflow.decide([slot(true, true, false, old)], c, m, false) == Action.Upload)
+        test.assert(smpflow.decide([], c, m, false) == Action.Upload)
+
+    test.case("a restart was asked for")
+    test.assert(smpflow.decide([slot(true, true, false, old), slot(false, false, true, mine)], c, Mode.TestAndConfirm, true) == Action.Hold)
+    test.assert(smpflow.decide([slot(true, true, false, old), slot(false, false, false, mine)], c, Mode.TestAndConfirm, true) == Action.Reverted)
+    test.assert(smpflow.decide([slot(true, true, false, old)], c, Mode.TestAndConfirm, true) == Action.Reverted)
+
+    test.case("a list with no running image")
+    test.assert(smpflow.decide([slot(false, false, false, mine)], c, Mode.TestAndConfirm, false) == Action.Mark)
+
+@test
+fn test_the_candidate_is_read_from_an_image_or_a_package() [io, fs, net, mutate, time]
+    let img = smpdevice.image_of(0x02030004, 300, 5)
+    match smpflow.candidate(img)
+        None    => test.fail("no candidate in an image")
+        Some(c) =>
+            test.assert_eq(c.version, "2.3.4")
+            test.assert_eq(c.number, 0x02030004)
+            test.assert_eq(c.hex, hex_of(img))
+            test.assert_eq(bytes.len(c.hash), 32)
+            test.assert_eq(c.size, bytes.len(img))
+            match smpflow.candidate(smppack.wrap(img))
+                None    => test.fail("no candidate in a package")
+                Some(p) =>
+                    test.assert_eq(p.hex, c.hex)
+                    test.assert_eq(p.size, c.size)
+    test.assert(smpflow.candidate(bytes.zeros(100)) == None)
+
+    test.case("the version the device lists")
+    test.assert_eq(smpflow.version_number("1.2.3"), 0x01020003)
+    test.assert_eq(smpflow.version_number("0.0.0"), 0)
+    test.assert_eq(smpflow.version_number("1.2"), 0 - 1)
+    test.assert_eq(smpflow.version_number("a.b.c"), 0 - 1)
+    test.assert_eq(smpflow.version_number("1.-2.3"), 0 - 1)
+
+@test
+fn test_the_record_is_text_and_text_is_the_record() [io, fs, net, mutate, time]
+    let img = image(300, 1)
+    var st = record_of(img, Mode.ConfirmOnly)
+    test.assert_eq(st.mode, 1)
+    test.assert_eq(st.stage, 0)
+    test.assert(not st.reset_sent)
+    st.stage = 3
+    st.reset_sent = true
+    let text = smpflow.state_text(st)
+    test.assert_eq(text, "hash=${hex_of(img)}\nmode=1\nstage=3\nreset=1\n")
+    match smpflow.state_parse(text)
+        None    => test.fail("a record that was written is not read")
+        Some(b) =>
+            test.assert_eq(b.hash, hex_of(img))
+            test.assert_eq(b.mode, 1)
+            test.assert_eq(b.stage, 3)
+            test.assert(b.reset_sent)
+            test.assert(smpflow.stage_of(b) == Stage.Reset)
+
+    test.case("text that is no record")
+    test.assert(smpflow.state_parse("") == None)
+    test.assert(smpflow.state_parse("hash=ab\nmode=0\nstage=0\n") == None)
+    test.assert(smpflow.state_parse("hash=ab\nmode=3\nstage=0\nreset=0\n") == None)
+    test.assert(smpflow.state_parse("hash=ab\nmode=0\nstage=7\nreset=0\n") == None)
+    test.assert(smpflow.state_parse("hash=ab\nmode=0\nstage=0\nreset=2\n") == None)
+    test.assert(smpflow.state_parse("hash=\nmode=0\nstage=0\nreset=0\n") == None)
+    test.assert(smpflow.state_parse("hash=ab\nmode=x\nstage=0\nreset=0\n") == None)
+
+    test.case("the stages and their names")
+    let names = ["inspect", "upload", "mark", "reset", "wait", "confirm", "done"]
+    for k in 0..7
+        st.stage = k
+        test.assert_eq(smpflow.stage_name(smpflow.stage_of(st)), names[k])
+    st.stage = 9
+    test.assert(smpflow.stage_of(st) == Stage.Inspect)
+
+@test
+fn test_the_clocks_tell_the_time_and_wait() [io, fs, net, mutate, time]
+    let m = smpflow.manual()
+    test.assert_eq(m.now_ms(), 0)
+    m.sleep_ms(500)
+    m.advance(100)
+    test.assert_eq(m.now_ms(), 600)
+    test.assert_eq(m.slept(), 500)
+
+    test.case("the machine's clock")
+    let s = smpflow.System { id: 0 }
+    let a = s.now_ms()
+    s.sleep_ms(3)
+    test.assert(s.now_ms() - a >= 3)
+
+@test
+fn test_an_upgrade_with_a_trial_and_a_confirmation_runs_to_the_end() [io, fs, net, mutate, time]
+    let img = fresh()
+    let t = smpdirect.direct()
+    let clk = smpflow.manual()
+    let w = writer()
+    let st = record_of(img, Mode.TestAndConfirm)
+    let rep = smpflow.run(t, img, smpflow.plan(Mode.TestAndConfirm, call_opts()), st, silent(), w, clk)
+    test.assert(rep.outcome == Outcome.Done)
+    test.assert(rep.stage == Stage.Done)
+    test.assert_eq(rep.old_version, "1.0.0")
+    test.assert_eq(rep.new_version, "2.0.0")
+    test.assert_eq(rep.code, 0)
+    test.assert(rep.requests >= 4)
+    test.assert_eq(rep.resumed_at, 0)
+    test.assert_eq(rep.reconnects, 1)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+    test.assert(smpdevice.running_confirmed())
+    test.assert_eq(smpdevice.restarts(), 1)
+    test.assert_eq(t.opens(), 2)
+
+    test.case("the journal heard each step and the record ends at the last")
+    test.assert(list.len(w.tape.lines) >= 7)
+    test.assert_eq(w.tape.lines[0], "the device runs 1.0.0, the candidate is 2.0.0")
+    test.assert_eq(st.stage, 6)
+    test.assert(st.reset_sent)
+    test.assert_eq(w.tape.records[list.len(w.tape.records) - 1], smpflow.state_text(st))
+    test.assert_eq(rep.log[0], "inspect: the device runs 1.0.0, the candidate is 2.0.0")
+    test.assert_eq(rep.log[list.len(rep.log) - 1], "done: the device runs 2.0.0")
+    test.assert_eq(list.len(rep.log), list.len(w.tape.lines))
+
+@test
+fn test_a_permanent_image_and_an_image_left_on_trial() [io, fs, net, mutate, time]
+    test.case("confirm only: the staged image is made permanent and no confirmation follows")
+    var img = fresh()
+    var t = smpdirect.direct()
+    var rep = go(t, img, Mode.ConfirmOnly, smpflow.manual())
+    test.assert(rep.outcome == Outcome.Done)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+    test.assert(smpdevice.running_confirmed())
+    test.assert_eq(smpdevice.restarts(), 1)
+
+    test.case("test only: the image runs on trial and stays unconfirmed")
+    img = fresh()
+    t = smpdirect.direct()
+    rep = go(t, img, Mode.TestOnly, smpflow.manual())
+    test.assert(rep.outcome == Outcome.Done)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+    test.assert(not smpdevice.running_confirmed())
+    test.assert(rep.stage == Stage.Done)
+
+@test
+fn test_an_image_that_runs_already_is_not_sent_again() [io, fs, net, mutate, time]
+    let img = fresh()
+    let first = go(smpdirect.direct(), img, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(first.outcome == Outcome.Done)
+    let t = smpdirect.direct()
+    let rep = go(t, img, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(rep.outcome == Outcome.AlreadyInstalled)
+    test.assert_eq(rep.requests, 0)
+    test.assert_eq(t.total(), 1)
+    test.assert_eq(rep.reconnects, 0)
+    test.assert_eq(smpdevice.restarts(), 1)
+
+    test.case("an image that runs on trial is confirmed, not sent again")
+    let img2 = fresh()
+    let trial = go(smpdirect.direct(), img2, Mode.TestOnly, smpflow.manual())
+    test.assert(trial.outcome == Outcome.Done)
+    test.assert(not smpdevice.running_confirmed())
+    let confirmed = go(smpdirect.direct(), img2, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(confirmed.outcome == Outcome.Done)
+    test.assert_eq(confirmed.requests, 0)
+    test.assert(smpdevice.running_confirmed())
+
+@test
+fn test_an_image_that_is_staged_already_is_marked_and_not_sent_again() [io, fs, net, mutate, time]
+    let img = fresh()
+    let t = smpdirect.direct()
+    test.assert(uploaded(smpapi.image_upload(t, img, call_opts(), silent())))
+    let rep = go(t, img, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(rep.outcome == Outcome.Done)
+    test.assert_eq(rep.requests, 0)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+
+fn uploaded(r: Result<Upload, SmpError>) -> Bool
+    match r
+        Ok(_)  => true
+        Err(_) => false
+
+@test
+fn test_a_link_cut_at_any_request_is_made_again_and_the_upgrade_ends_the_same() [io, fs, net, mutate, time]
+    let img = fresh()
+    let clean = smpdirect.direct()
+    let ok = go(clean, img, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(ok.outcome == Outcome.Done)
+    let n = clean.total()
+    test.assert(n >= 10)
+    for k in 1..n + 2
+        for after in [false, true]
+            test.case("a cut at request ${k}, after the device handled it: ${after}")
+            let img2 = fresh()
+            let t = smpdirect.direct()
+            if after
+                t.cut_after(k)
+            else
+                t.cut_before(k)
+            let rep = go(t, img2, Mode.TestAndConfirm, smpflow.manual())
+            test.assert(rep.outcome == Outcome.Done)
+            test.assert_eq(smpdevice.running_hash(), hex_of(img2))
+            test.assert(smpdevice.running_confirmed())
+            if k <= n
+                test.assert(rep.reconnects >= 1)
+
+@test
+fn test_a_cut_upload_resumes_from_the_offset_the_device_kept() [io, fs, net, mutate, time]
+    smpdevice.fresh(V1)
+    let img = image(4000, 6)
+    let t = smpdirect.direct()
+    t.cut_after(9)
+    let rep = go(t, img, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(rep.outcome == Outcome.Done)
+    test.assert(rep.resumed_at > 832)
+    test.assert(rep.requests <= 11)
+
+@test
+fn test_an_image_that_hangs_is_reverted_and_the_run_says_so() [io, fs, net, mutate, time]
+    let img = fresh()
+    let old = smpdevice.running_hash()
+    smpdevice.set_hang(true)
+    let t = smpdirect.direct()
+    let st = record_of(img, Mode.TestAndConfirm)
+    let rep = smpflow.run(t,
+        img,
+        smpflow.plan(Mode.TestAndConfirm, call_opts()),
+        st,
+        silent(),
+        quiet(),
+        smpflow.manual())
+    test.assert(rep.outcome == Outcome.Reverted)
+    test.assert_eq(smpdevice.running_hash(), old)
+    test.assert_eq(smpdevice.restarts(), 2)
+    test.assert(st.reset_sent)
+
+    test.case("a record that says a restart was asked for finds the revert; a fresh record sends the image again")
+    let again = smpflow.run(t,
+        img,
+        smpflow.plan(Mode.TestAndConfirm, call_opts()),
+        st,
+        silent(),
+        quiet(),
+        smpflow.manual())
+    test.assert(again.outcome == Outcome.Reverted)
+    test.assert_eq(again.requests, 0)
+    let fresh_record = record_of(img, Mode.TestAndConfirm)
+    let third = smpflow.run(t,
+        img,
+        smpflow.plan(Mode.TestAndConfirm, call_opts()),
+        fresh_record,
+        silent(),
+        quiet(),
+        smpflow.manual())
+    test.assert(third.outcome == Outcome.Reverted)
+    test.assert(third.requests > 0)
+
+@test
+fn test_a_device_that_never_returns_ends_the_run_when_the_time_is_up() [io, fs, net, mutate, time]
+    let img = fresh()
+    smpdevice.set_off(1000000)
+    let t = smpdirect.direct()
+    let clk = smpflow.manual()
+    let rep = go(t, img, Mode.TestAndConfirm, clk)
+    test.assert(rep.outcome == Outcome.NeverReturned)
+    test.assert(rep.stage == Stage.Wait)
+    test.assert(rep.elapsed_ms >= 120000)
+    test.assert(rep.elapsed_ms < 130000)
+    test.assert(clk.slept() > 0)
+    test.assert_eq(rep.reconnects, 1 - 1)
+
+    test.case("a device that answers the reset and does not restart")
+    let img2 = fresh()
+    smpdevice.set_ignore_reset(true)
+    let q = smpdirect.direct()
+    let rep2 = go(q, img2, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(rep2.outcome == Outcome.NeverReturned)
+    test.assert_eq(smpdevice.restarts(), 0)
+
+@test
+fn test_a_link_that_cannot_be_made_again_ends_the_run() [io, fs, net, mutate, time]
+    let img = fresh()
+    smpdevice.set_off(1000000)
+    let t = smpdirect.direct()
+    t.cut_before(1)
+    let clk = smpflow.manual()
+    let rep = go(t, img, Mode.TestAndConfirm, clk)
+    test.assert(rep.outcome == Outcome.LinkLost)
+    test.assert(rep.stage == Stage.Inspect)
+    test.assert(rep.code < 0)
+    test.assert(clk.now_ms() >= 30000)
+    test.assert(t.reopen_calls() > 3)
+
+@test
+fn test_a_device_that_answers_nothing_with_the_link_up_is_asked_a_few_times() [io, fs, net, mutate, time]
+    let img = fresh()
+    let t = Mute { id: 0 }
+    let clk = smpflow.manual()
+    let rep = go(t, img, Mode.TestAndConfirm, clk)
+    test.assert(rep.outcome == Outcome.Failed)
+    test.assert_eq(rep.code, E_NO_ANSWER)
+    test.assert(clk.slept() >= 1000)
+
+// A transport whose link is up and that never answers.
+struct Mute
+    id: Int
+
+impl Transport[mutate] for Mute
+    fn send(self, packet: Bytes) -> Bool [mutate]
+        true
+
+    fn recv(self, ms: Int) -> ?Bytes [mutate]
+        None
+
+impl Reopen[mutate] for Mute
+    fn lost(self) -> Bool
+        false
+
+    fn reopen(self, ms: Int) -> Bool [mutate]
+        true
+
+@test
+fn test_the_device_refuses_what_it_does_not_take_and_the_run_says_which_command() [io, fs, net, mutate, time]
+    test.case("an image larger than the slot")
+    smpdevice.fresh(V1)
+    let big = image(20000, 2)
+    let rep = go(smpdirect.direct(), big, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(rep.outcome == Outcome.Failed)
+    test.assert_eq(rep.code, 2)
+    test.assert(rep.stage == Stage.Upload)
+
+    test.case("a device that does not list the image after its uploads")
+    let img = fresh()
+    let blind = Blind { inner: smpdirect.direct(), st: BlindState { replies: [] } }
+    let b = go(blind, img, Mode.TestAndConfirm, smpflow.manual())
+    test.assert(b.outcome == Outcome.Failed)
+    test.assert_eq(b.code, E_HASH)
+
+// A transport that answers every request of the image list with an empty list and passes the others to the device.
+struct Blind
+    inner: Direct
+    st: BlindState
+
+struct BlindState
+    var replies: [Bytes]
+
+impl Transport[mutate] for Blind
+    fn send(self, packet: Bytes) -> Bool [mutate]
+        var st = self.st
+        let op = bytes.byte_at(packet, 0) ?? 0
+        let group = bytes.byte_at(packet, 5) ?? 0
+        let id = bytes.byte_at(packet, 7) ?? 0
+        if op == OP_READ and group == GROUP_IMAGE and id == 0
+            let seq = bytes.byte_at(packet, 6) ?? 0
+            list.push(st.replies,
+                bytes.from_byte_list([1, 0, 0, 9, 0, 1, seq, 0, 0xA1, 0x66, 0x69, 0x6D, 0x61, 0x67, 0x65, 0x73, 0x80]))
+            return true
+        self.inner.send(packet)
+
+    fn recv(self, ms: Int) -> ?Bytes [mutate]
+        var st = self.st
+        if list.len(st.replies) > 0
+            let r = st.replies[0]
+            st.replies = st.replies[1:list.len(st.replies)]
+            return Some(r)
+        self.inner.recv(ms)
+
+impl Reopen[mutate] for Blind
+    fn lost(self) -> Bool
+        self.inner.lost()
+
+    fn reopen(self, ms: Int) -> Bool [mutate]
+        self.inner.reopen(ms)
+
+@test
+fn test_a_candidate_is_refused_before_anything_is_sent_when_it_cannot_be_installed() [io, fs, net, mutate, time]
+    let img = fresh()
+    let base = smpflow.plan(Mode.TestAndConfirm, call_opts())
+
+    test.case("a file that is not an image")
+    let rep = smpflow.run(smpdirect.direct(),
+        bytes.zeros(100),
+        base,
+        record_of(img, Mode.TestAndConfirm),
+        silent(),
+        quiet(),
+        smpflow.manual())
+    test.assert(rep.outcome == Outcome.Refused)
+    test.assert_eq(rep.requests, 0)
+    test.assert_eq(smpdevice.handled(), 0)
+
+    test.case("an image larger than the second slot the plan states")
+    let small = Plan { mode: base.mode,
+        call: base.call,
+        wait_ms: base.wait_ms,
+        link_ms: base.link_ms,
+        poll_ms: base.poll_ms,
+        poll_max_ms: base.poll_max_ms,
+        slot_bytes: 1000,
+        refuse_older: false,
+        retries: base.retries }
+    let t = smpdirect.direct()
+    let big = smpflow.run(t, img, small, record_of(img, Mode.TestAndConfirm), silent(), quiet(), smpflow.manual())
+    test.assert(big.outcome == Outcome.Refused)
+    test.assert_eq(t.total(), 1)
+
+    test.case("an image that is not newer, when the plan asks for it")
+    let strict = Plan { mode: base.mode,
+        call: base.call,
+        wait_ms: base.wait_ms,
+        link_ms: base.link_ms,
+        poll_ms: base.poll_ms,
+        poll_max_ms: base.poll_max_ms,
+        slot_bytes: 0,
+        refuse_older: true,
+        retries: base.retries }
+    let same = smpdevice.image_of(V1, 300, 77)
+    let u = smpflow.run(smpdirect.direct(),
+        same,
+        strict,
+        record_of(same, Mode.TestAndConfirm),
+        silent(),
+        quiet(),
+        smpflow.manual())
+    test.assert(u.outcome == Outcome.Refused)
+    test.assert_eq(u.old_version, "1.0.0")
+    let newer = smpflow.run(smpdirect.direct(),
+        img,
+        strict,
+        record_of(img, Mode.TestAndConfirm),
+        silent(),
+        quiet(),
+        smpflow.manual())
+    test.assert(newer.outcome == Outcome.Done)
+
+@test
+fn test_a_transfer_that_is_stopped_resumes_when_the_flow_runs_again() [io, fs, net, mutate, time]
+    smpdevice.fresh(V1)
+    let img = image(4000, 8)
+    let t = smpdirect.direct()
+    let p = smpflow.plan(Mode.TestAndConfirm, call_opts())
+    let st = record_of(img, Mode.TestAndConfirm)
+    let stopped = smpflow.run(t, img, p, st, gate(6), quiet(), smpflow.manual())
+    test.assert(stopped.outcome == Outcome.Cancelled)
+    test.assert_eq(stopped.code, E_CANCELLED)
+    test.assert(stopped.stage == Stage.Upload)
+    test.assert_eq(smpdevice.restarts(), 0)
+    let rep = smpflow.run(t, img, p, st, silent(), quiet(), smpflow.manual())
+    test.assert(rep.outcome == Outcome.Done)
+    test.assert(rep.resumed_at > 416)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+
+@test
+fn test_a_record_of_another_image_is_started_again() [io, fs, net, mutate, time]
+    let img = fresh()
+    var other = record_of(image(300, 99), Mode.TestOnly)
+    other.stage = 5
+    other.reset_sent = true
+    let rep = smpflow.run(smpdirect.direct(),
+        img,
+        smpflow.plan(Mode.TestAndConfirm, call_opts()),
+        other,
+        silent(),
+        quiet(),
+        smpflow.manual())
+    test.assert(rep.outcome == Outcome.Done)
+    test.assert_eq(other.hash, hex_of(img))
+    test.assert_eq(other.mode, 0)
+
+// A transport that reaches the device until the request that restarts it, and then says nothing, keeps its link up and cannot be made again.
+struct Stall
+    inner: Direct
+    st: StallState
+
+struct StallState
+    var muted: Bool
+
+impl Transport[mutate] for Stall
+    fn send(self, packet: Bytes) -> Bool [mutate]
+        var st = self.st
+        if st.muted
+            return true
+        let group = bytes.byte_at(packet, 5) ?? 0
+        let id = bytes.byte_at(packet, 7) ?? 0
+        let ok = self.inner.send(packet)
+        if group == GROUP_OS and id == 5
+            st.muted = true
+        ok
+
+    fn recv(self, ms: Int) -> ?Bytes [mutate]
+        self.inner.recv(ms)
+
+impl Reopen[mutate] for Stall
+    fn lost(self) -> Bool
+        false
+
+    fn reopen(self, ms: Int) -> Bool [mutate]
+        false
+
+@test
+fn test_a_device_that_goes_quiet_after_the_reset_is_waited_for_until_the_time_is_up() [io, fs, net, mutate, time]
+    let img = fresh()
+    let t = Stall { inner: smpdirect.direct(), st: StallState { muted: false } }
+    let clk = smpflow.manual()
+    let rep = go(t, img, Mode.TestAndConfirm, clk)
+    test.assert(rep.outcome == Outcome.NeverReturned)
+    test.assert(clk.now_ms() >= 120000)
+
+@test
+fn test_a_wait_with_no_pause_still_ends() [io, fs, net, mutate, time]
+    let img = fresh()
+    smpdevice.set_off(1000000)
+    let t = smpdirect.direct()
+    t.cut_before(1)
+    let base = smpflow.plan(Mode.TestAndConfirm, call_opts())
+    let eager = Plan { mode: base.mode,
+        call: base.call,
+        wait_ms: base.wait_ms,
+        link_ms: base.link_ms,
+        poll_ms: 0,
+        poll_max_ms: 0,
+        slot_bytes: 0,
+        refuse_older: false,
+        retries: 0 }
+    let rep = smpflow.run(t, img, eager, record_of(img, Mode.TestAndConfirm), silent(), quiet(), smpflow.manual())
+    test.assert(rep.outcome == Outcome.LinkLost)
+    test.assert_eq(t.reopen_calls(), 4000)
+
+@test
+fn test_a_device_with_no_running_image_in_its_list_is_not_refused_for_its_version() [io, fs, net, mutate, time]
+    let img = fresh()
+    let base = smpflow.plan(Mode.TestAndConfirm, call_opts())
+    let strict = Plan { mode: base.mode,
+        call: base.call,
+        wait_ms: base.wait_ms,
+        link_ms: base.link_ms,
+        poll_ms: base.poll_ms,
+        poll_max_ms: base.poll_max_ms,
+        slot_bytes: 0,
+        refuse_older: true,
+        retries: base.retries }
+    let blind = Blind { inner: smpdirect.direct(), st: BlindState { replies: [] } }
+    let rep = smpflow.run(blind, img, strict, record_of(img, Mode.TestAndConfirm), silent(), quiet(), smpflow.manual())
+    test.assert(rep.outcome == Outcome.Failed)
+    test.assert_eq(rep.old_version, "")
+    test.assert_eq(rep.code, E_HASH)

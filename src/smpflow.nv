@@ -1,0 +1,674 @@
+// smpflow: the upgrade of a device that runs novoboot and the SMP service, as a state machine over a `Transport`.
+//
+// An upgrade has six steps: read the image list, check the candidate against it, upload with progress, mark the new image for a trial or
+// as permanent, reset, wait for the device to come back and read the list again, confirm.  Every step ends in a read of the list, and the
+// next step is derived from what the device says, never from a counter of the flow: a link that dropped, a process that was killed and a
+// device that restarted all resume the same way.  `decide` is that derivation and holds the table of the stages:
+//
+//   the running image is the candidate and confirmed          done (or, with a trial only, still on trial: done)
+//   the running image is the candidate, not confirmed          confirm
+//   a restart was asked for and the candidate is not running   the device has not restarted yet while the candidate waits as pending,
+//                                                              reverted otherwise
+//   the candidate is in the other slot and pending             reset
+//   the candidate is in the other slot, not pending            mark it (test, or confirm for a permanent image)
+//   the candidate is nowhere                                   upload (the device answers the offset it kept, so a cut upload resumes)
+//
+// A restart that was asked for is the one fact the list cannot show: a candidate that failed its trial is not listed, so a device that came
+// back on the old image looks like a device that was never given the new one.  The flow holds it in the `FlowState` record, which the
+// program keeps between runs (`state_text`, `state_parse`) and which `run` hands to a `Journal` at each step.
+//
+// `run` takes a `Transport` that is also a `Reopen`: when a command fails and the link has ended, or when the device is restarting, it
+// asks the transport to reach the device again, with growing pauses, for as long as the plan allows.  Time comes from a `Clock` the caller
+// passes: `System` is the machine's, `Manual` is a clock a test moves.  Nothing here prints, opens a file or knows a link, so a program on a
+// PC, an application on a phone and a suite run the same flow.
+
+use std.bytes
+use std.time
+use smpapi
+use smppack
+use smptransport
+
+// The most steps one run takes, which ends a loop that no device state would end.
+const MAX_STEPS = 4000
+
+// The most uploads that finished and left no candidate in the list, before the flow gives up.
+const MAX_UPLOADS = 3
+
+// The most lines the report's log holds; the oldest go.
+const MAX_LOG = 200
+
+// ── Time ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+// The time a flow waits by: the milliseconds since some start, and a pause.
+pub trait Clock[e]
+    fn now_ms(self) -> Int [e]
+    fn sleep_ms(self, ms: Int) [e]
+
+// The machine's clock.
+pub struct System
+    id: Int
+
+impl Clock[time] for System
+    @tier(app)
+    fn now_ms(self) -> Int [time]
+        time.ticks_us() / 1000
+
+    @tier(app)
+    fn sleep_ms(self, ms: Int) [time]
+        time.sleep(ms as Float / 1000.0)
+
+// What a `Manual` clock keeps.  A struct is a reference, so the methods, whose receiver is by value, change it through a local `var`.
+struct ClockState
+    var now: Int
+    var slept: Int
+
+// A clock that moves only when it is told to: `sleep_ms` adds to it and takes no time, so a wait of two minutes is a line of a test.
+pub struct Manual
+    st: ClockState
+
+// A manual clock at 0.
+pub @tier(app)
+fn manual() -> Manual
+    Manual { st: ClockState { now: 0, slept: 0 } }
+
+impl Manual
+    // The time moves on by `ms`.
+    @tier(app)
+    fn advance(self, ms: Int) [mutate]
+        var st = self.st
+        st.now = st.now + ms
+
+    // The sum of the pauses asked of the clock.
+    @tier(app)
+    fn slept(self) -> Int
+        self.st.slept
+
+impl Clock[mutate] for Manual
+    @tier(app)
+    fn now_ms(self) -> Int [mutate]
+        self.st.now
+
+    @tier(app)
+    fn sleep_ms(self, ms: Int) [mutate]
+        var st = self.st
+        st.now = st.now + ms
+        st.slept = st.slept + ms
+
+// ── The candidate ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+// The image to install: what the device lists and checks it by.  `hash` is the 32 bytes at 0x20 of the NOVB header, `version` its text
+// ("major.minor.patch") and `number` the same as major << 24 | minor << 16 | patch.
+pub struct Candidate
+    hash: Bytes
+    hex: Str
+    version: Str
+    number: Int
+    size: Int
+
+// The candidate in `file`, a NOVB image or the package that wraps one.  None for any other file, whose hash the device would not list.
+pub @tier(app)
+fn candidate(file: Bytes) -> ?Candidate
+    let digest = smpapi.expected_hash(file)
+    if bytes.len(digest) == 0
+        return None
+    let img = smppack.unwrap(file)
+    let major = bytes.byte_at(img, 0x0C) ?? 0
+    let minor = bytes.byte_at(img, 0x0D) ?? 0
+    let patch = (bytes.byte_at(img, 0x0E) ?? 0) + (bytes.byte_at(img, 0x0F) ?? 0) * 256
+    Some(Candidate { hash: digest,
+        hex: bytes.to_hex(digest),
+        version: "${major}.${minor}.${patch}",
+        number: major * 16777216 + minor * 65536 + patch,
+        size: bytes.len(img) })
+
+// The version in the text the device lists ("major.minor.patch") as the number of `Candidate`, -1 for a text that is not one.
+pub @tier(app)
+fn version_number(text: Str) -> Int
+    let w = str.split(text, ".")
+    if list.len(w) != 3
+        return 0 - 1
+    let major = str.to_int(w[0]) ?? 0 - 1
+    let minor = str.to_int(w[1]) ?? 0 - 1
+    let patch = str.to_int(w[2]) ?? 0 - 1
+    if major < 0 or minor < 0 or patch < 0
+        return 0 - 1
+    major * 16777216 + minor * 65536 + patch
+
+// ── What the caller states ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+// What the upgrade ends with on the device.  `TestAndConfirm` marks the image for a trial and confirms it once it runs;
+// `ConfirmOnly` stages it as permanent, so the bootloader keeps it with no trial; `TestOnly` leaves it on trial, which the bootloader
+// reverts at the next start unless the application confirms it.
+pub @value
+enum Mode
+    TestAndConfirm
+    ConfirmOnly
+    TestOnly
+
+// The steps of an upgrade, as the record names them.
+pub @value
+enum Stage
+    Inspect
+    Upload
+    Mark
+    Reset
+    Wait
+    Confirm
+    Done
+
+// How the run ended.
+pub @value
+enum Outcome
+    // The device runs the candidate as the mode asks.
+    Done
+    // The device ran the candidate, as the mode asks, before the run began; nothing was sent but reads.
+    AlreadyInstalled
+    // The device restarted and came back on the old image: the bootloader reverted the candidate.
+    Reverted
+    // The device did not come back within the plan's time after the reset, or did not restart.
+    NeverReturned
+    // The candidate was refused before an upload: not an image, too large for the slot, or not newer.
+    Refused
+    // The progress callback answered false.
+    Cancelled
+    // The link ended and could not be made again within the plan's time.
+    LinkLost
+    // The device refused a command, or answered none, or did not list the candidate after its uploads.
+    Failed
+
+// How long the flow waits, how often it asks again, and what it checks.  `call` is the time and tries of each command (smpapi.nv);
+// `wait_ms` is how long the device may be away after a reset (the swap of a 340 KB image takes 63 seconds on the nRF54LM20 DK);
+// `link_ms` is how long a link that dropped is tried again, each time; `poll_ms` is the first pause between tries and doubles up to
+// `poll_max_ms`; `slot_bytes` is the size of the second slot, 0 when it is not known; `refuse_older` refuses a candidate whose version is
+// not above the running one; `retries` is how often a command that failed with the link still up is tried again before the run fails.
+pub @value
+struct Plan
+    mode: Mode
+    call: CallOptions
+    wait_ms: Int
+    link_ms: Int
+    poll_ms: Int
+    poll_max_ms: Int
+    slot_bytes: Int
+    refuse_older: Bool
+    retries: Int
+
+// A plan for `mode`: commands of `call`, two minutes for the device after a reset, half a minute for a dropped link, pauses of half a second
+// to four, no slot size, older images allowed, two retries.
+pub @tier(app)
+fn plan(mode: Mode, call: CallOptions) -> Plan
+    Plan { mode: mode,
+        call: call,
+        wait_ms: 120000,
+        link_ms: 30000,
+        poll_ms: 500,
+        poll_max_ms: 4000,
+        slot_bytes: 0,
+        refuse_older: false,
+        retries: 2 }
+
+// ── The record ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+// What a program keeps between runs: the candidate's hash, the mode, the last step entered, and whether a restart was asked for.  A
+// struct is a reference, so a run changes the record it is given and a program reads it after each step through its `Journal`.
+pub struct FlowState
+    var hash: Str
+    var mode: Int
+    var stage: Int
+    var reset_sent: Bool
+
+// A record for the candidate `c` and the mode, at the first step.
+pub @tier(app)
+fn new_state(c: Candidate, mode: Mode) -> FlowState
+    FlowState { hash: c.hex,
+        mode: mode_number(mode),
+        stage: stage_number(Stage.Inspect),
+        reset_sent: false }
+
+// The number a mode has in the record.
+@tier(app)
+fn mode_number(m: Mode) -> Int
+    match m
+        Mode.TestAndConfirm => 0
+        Mode.ConfirmOnly    => 1
+        Mode.TestOnly       => 2
+
+// The number a stage has in the record.
+@tier(app)
+fn stage_number(s: Stage) -> Int
+    match s
+        Stage.Inspect => 0
+        Stage.Upload  => 1
+        Stage.Mark    => 2
+        Stage.Reset   => 3
+        Stage.Wait    => 4
+        Stage.Confirm => 5
+        Stage.Done    => 6
+
+// The stage a record names, `Inspect` for a number that is none.
+pub @tier(app)
+fn stage_of(st: FlowState) -> Stage
+    match st.stage
+        1 => Stage.Upload
+        2 => Stage.Mark
+        3 => Stage.Reset
+        4 => Stage.Wait
+        5 => Stage.Confirm
+        6 => Stage.Done
+        _ => Stage.Inspect
+
+// The name of a stage, for a log.
+pub @tier(app)
+fn stage_name(s: Stage) -> Str
+    match s
+        Stage.Inspect => "inspect"
+        Stage.Upload  => "upload"
+        Stage.Mark    => "mark"
+        Stage.Reset   => "reset"
+        Stage.Wait    => "wait"
+        Stage.Confirm => "confirm"
+        Stage.Done    => "done"
+
+// The record as text, four lines of `key=value`.
+pub @tier(app)
+fn state_text(st: FlowState) -> Str
+    let reset = if st.reset_sent
+        1
+    else
+        0
+    "hash=${st.hash}\nmode=${st.mode}\nstage=${st.stage}\nreset=${reset}\n"
+
+// The value of `key` in the lines of a record, or None.
+@tier(app)
+fn field(lines: [Str], key: Str) -> ?Str
+    for l in lines
+        if str.starts_with(l, "${key}=")
+            return Some(str.slice(l, str.len(key) + 1, str.len(l)))
+    None
+
+// The record the text holds, None for text that is none: a field missing, or a number that is not one.
+pub @tier(app)
+fn state_parse(text: Str) -> ?FlowState
+    let lines = str.split(text, "\n")
+    let digest = field(lines, "hash") ?? ""
+    let mode = str.to_int(field(lines, "mode") ?? "") ?? 0 - 1
+    let stage = str.to_int(field(lines, "stage") ?? "") ?? 0 - 1
+    let reset = str.to_int(field(lines, "reset") ?? "") ?? 0 - 1
+    if digest == "" or mode < 0 or mode > 2 or stage < 0 or stage > 6 or reset < 0 or reset > 1
+        return None
+    Some(FlowState { hash: digest, mode: mode, stage: stage, reset_sent: reset == 1 })
+
+// Told at each step: the record as it stands and a line that says what happened.  A program saves the record and shows the line.
+pub trait Journal[e]
+    fn record(self, st: FlowState, line: Str) [e]
+
+// A journal that keeps nothing.
+pub struct Quiet
+    id: Int
+
+impl Journal[mutate] for Quiet
+    @tier(app)
+    fn record(self, st: FlowState, line: Str) [mutate]
+        ()
+
+// ── The table ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+// What the list says to do next.  `Hold` is a device that was told to restart and has not yet.
+pub @value
+enum Action
+    Upload
+    Mark
+    Reset
+    Confirm
+    Done
+    Hold
+    Reverted
+
+// The slot that runs, None for a list that has none.
+@tier(app)
+fn running_of(slots: [Slot]) -> ?Slot
+    for s in slots
+        if s.active
+            return Some(s)
+    None
+
+// The slot of the candidate that does not run, None when the candidate is in no other slot.
+@tier(app)
+fn staged_of(slots: [Slot], c: Candidate) -> ?Slot
+    for s in slots
+        if not s.active and bytes.to_hex(s.hash) == c.hex
+            return Some(s)
+    None
+
+// The next step for the list `slots` of a device, the candidate, the mode, and whether a restart was asked for: the table of the stages.
+pub @tier(app)
+fn decide(slots: [Slot], c: Candidate, mode: Mode, reset_sent: Bool) -> Action
+    match running_of(slots)
+        Some(r) =>
+            if bytes.to_hex(r.hash) == c.hex
+                if r.confirmed or mode == Mode.TestOnly
+                    return Action.Done
+                return Action.Confirm
+        None    => ()
+    match staged_of(slots, c)
+        Some(o) =>
+            if reset_sent
+                if o.pending
+                    return Action.Hold
+                return Action.Reverted
+            if o.pending
+                return Action.Reset
+            Action.Mark
+        None    =>
+            if reset_sent
+                return Action.Reverted
+            Action.Upload
+
+// ── The report ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+// What a run did.  `stage` is the step it ended in; `code` is the code of the command that failed, 0 when none did, and `why` says it in a
+// sentence; `old_version` is the running version when the run began; `requests` counts the upload requests sent and `resumed_at` is the
+// offset a resumed upload went on from, 0 when none was resumed; `reconnects` counts the links made again; `log` holds the lines the
+// journal was given.
+pub struct Report
+    outcome: Outcome
+    stage: Stage
+    code: Int
+    why: Str
+    old_version: Str
+    new_version: Str
+    requests: Int
+    resumed_at: Int
+    reconnects: Int
+    elapsed_ms: Int
+    log: [Str]
+
+// What a run keeps while it goes.  A struct is a reference.
+struct Run
+    var stage: Stage
+    var reset_sent: Bool
+    var reset_at: Int
+    var worked: Bool
+    var uploads: Int
+    var fails: Int
+    var requests: Int
+    var resumed_at: Int
+    var reconnects: Int
+    var old_version: Str
+    var log: [Str]
+    var outcome: Outcome
+    var code: Int
+    var why: Str
+    var finished: Bool
+
+// Notes a step: the record, the journal and the log.
+@tier(app)
+fn note<J: Journal[e]>(r: Run, st: FlowState, j: J, s: Stage, line: Str) [e, mutate]
+    var run = r
+    var rec = st
+    run.stage = s
+    rec.stage = stage_number(s)
+    rec.reset_sent = run.reset_sent
+    list.push(run.log, "${stage_name(s)}: ${line}")
+    if list.len(run.log) > MAX_LOG
+        run.log = run.log[1:list.len(run.log)]
+    j.record(st, line)
+
+// Ends the run with `outcome`.
+@tier(app)
+fn finish(r: Run, outcome: Outcome, code: Int, why: Str) [mutate]
+    var run = r
+    run.outcome = outcome
+    run.code = code
+    run.why = why
+    run.finished = true
+
+// The smaller of two numbers.
+@tier(app)
+fn least(a: Int, b: Int) -> Int
+    if a < b
+        return a
+    b
+
+// Reaches the device again: tries `reopen` until it answers true or `budget_ms` has gone by on the clock, with pauses that double from the
+// plan's first to its largest.  Answers whether the link is up.
+@tier(app)
+fn reconnect<T: Transport[e] + Reopen[f], K: Clock[g]>(t: T, r: Run, plan: Plan, clk: K,
+                                                       budget_ms: Int) -> Bool [e, f, g, mutate]
+    var run = r
+    let start = clk.now_ms()
+    var pause = plan.poll_ms
+    for _i in 0..4000
+        let left = budget_ms - (clk.now_ms() - start)
+        if left <= 0
+            return false
+        if t.reopen(left)
+            run.reconnects = run.reconnects + 1
+            return true
+        clk.sleep_ms(least(pause, left))
+        pause = least(pause * 2, plan.poll_max_ms)
+    false
+
+// What a failed command means for the run.  Answers true when the run goes on: the device is reached again, or the command may be asked again.
+// A code of the device ends the run; a link that ended is made again for the plan's time; a command that went unanswered with the link up is
+// asked again `retries` times, and when a restart was asked for the link is made again at once, since the device may be restarting.
+@tier(app)
+fn recover<T: Transport[e] + Reopen[f], K: Clock[g]>(t: T, r: Run, plan: Plan, clk: K, code: Int,
+                                                     what: Str) -> Bool [e, f, g, mutate]
+    var run = r
+    if code == E_CANCELLED
+        finish(run, Outcome.Cancelled, code, "the transfer was stopped")
+        return false
+    if code > 0
+        finish(run,
+            Outcome.Failed,
+            code,
+            "${what}: the device answered code ${code} (${smpapi.code_name(code)})")
+        return false
+    if t.lost() or run.reset_sent
+        if reconnect(t, run, plan, clk, plan.link_ms)
+            return true
+        if run.reset_sent
+            return true
+        finish(run,
+            Outcome.LinkLost,
+            code,
+            "${what}: the link ended and could not be made again within ${plan.link_ms} ms")
+        return false
+    run.fails = run.fails + 1
+    if run.fails > plan.retries
+        finish(run,
+            Outcome.Failed,
+            code,
+            "${what}: the device gave no usable answer in ${plan.retries + 1} tries")
+        return false
+    clk.sleep_ms(plan.poll_ms)
+    true
+
+// The first problem with uploading `c` to a device whose list is `slots`, "" when there is none.
+@tier(app)
+fn objection(slots: [Slot], c: Candidate, plan: Plan) -> Str
+    if plan.slot_bytes > 0 and c.size > plan.slot_bytes
+        return "the image is ${c.size} bytes and the second slot holds ${plan.slot_bytes}"
+    if plan.refuse_older
+        match running_of(slots)
+            Some(r) =>
+                if version_number(r.version) >= c.number
+                    return "version ${c.version} is not above the running ${r.version}"
+            None    => ()
+    ""
+
+// Takes the next step of the upgrade.  `slots` is the list the device gave.
+@tier(app)
+fn act<T: Transport[e] + Reopen[f], P: Progress[g], J: Journal[h], K: Clock[k]>(t: T, file: Bytes,
+                                                                                c: Candidate,
+                                                                                slots: [Slot],
+                                                                                plan: Plan,
+                                                                                st: FlowState,
+                                                                                r: Run, p: P, j: J,
+                                                                                clk: K) [e, f, g, h, k, mutate]
+    var run = r
+    match decide(slots, c, plan.mode, run.reset_sent)
+        Action.Done     =>
+            if run.worked
+                finish(run, Outcome.Done, 0, "the device runs ${c.version}")
+            else
+                finish(run, Outcome.AlreadyInstalled, 0, "the device runs ${c.version} already")
+        Action.Reverted =>
+            finish(run,
+                Outcome.Reverted,
+                0,
+                "the device came back on the old image: the bootloader reverted ${c.version}")
+        Action.Hold     =>
+            note(run, st, j, Stage.Wait, "the device has not restarted yet")
+            clk.sleep_ms(plan.poll_ms)
+        Action.Upload   =>
+            let why = objection(slots, c, plan)
+            if why != ""
+                finish(run, Outcome.Refused, 0, why)
+                return
+            if run.uploads >= MAX_UPLOADS
+                finish(run,
+                    Outcome.Failed,
+                    E_HASH,
+                    "the device lists no image with the hash of ${c.version} after ${run.uploads} uploads")
+                return
+            note(run, st, j, Stage.Upload, "${c.size} bytes of ${c.version}")
+            match smpapi.image_upload_to(t, 0, file, plan.call, p)
+                Ok(u)  =>
+                    run.requests = run.requests + u.requests
+                    if run.resumed_at == 0
+                        run.resumed_at = u.resumed_at
+                    run.uploads = run.uploads + 1
+                    run.worked = true
+                    run.fails = 0
+                Err(x) =>
+                    let _ = recover(t, run, plan, clk, x.code, "the upload")
+        Action.Mark     =>
+            note(run,
+                st,
+                j,
+                Stage.Mark,
+                (if plan.mode == Mode.ConfirmOnly then "confirm the staged image" else "test the staged image"))
+            let marked = if plan.mode == Mode.ConfirmOnly
+                smpapi.image_confirm(t, c.hash, plan.call)
+            else
+                smpapi.image_test(t, c.hash, plan.call)
+            match marked
+                Ok(_)  =>
+                    run.worked = true
+                    run.fails = 0
+                Err(x) =>
+                    let _ = recover(t, run, plan, clk, x.code, "marking the image")
+        Action.Reset    =>
+            note(run, st, j, Stage.Reset, "restart the device")
+            match smpapi.reset(t, plan.call)
+                Ok(_)  =>
+                    run.reset_sent = true
+                    run.reset_at = clk.now_ms()
+                    run.worked = true
+                    run.fails = 0
+                    note(run, st, j, Stage.Wait, "the device was told to restart")
+                Err(x) =>
+                    let _ = recover(t, run, plan, clk, x.code, "the restart")
+        Action.Confirm  =>
+            note(run, st, j, Stage.Confirm, "confirm the running image")
+            match smpapi.image_confirm(t, bytes.zeros(0), plan.call)
+                Ok(_)  =>
+                    run.worked = true
+                    run.fails = 0
+                Err(x) =>
+                    let _ = recover(t, run, plan, clk, x.code, "the confirmation")
+
+// Runs the upgrade of the device behind `t` to the image in `file`, as `plan` says, from the step the device's list names.  `st` is the
+// record of the upgrade, made by `new_state` or read by `state_parse`; a record of another image is started again.  `p` hears each response
+// of the upload, `j` each step, and `clk` is the time.  The report says how it ended.
+pub @tier(app)
+fn run<T: Transport[e] + Reopen[f], P: Progress[g], J: Journal[h], K: Clock[k]>(t: T, file: Bytes,
+                                                                                plan: Plan,
+                                                                                st: FlowState, p: P,
+                                                                                j: J,
+                                                                                clk: K) -> Report [e, f, g, h, k, mutate]
+    let start = clk.now_ms()
+    match candidate(file)
+        None    =>
+            return Report { outcome: Outcome.Refused,
+                stage: Stage.Inspect,
+                code: 0,
+                why: "the file is neither a NOVB image nor a package that holds one",
+                old_version: "",
+                new_version: "",
+                requests: 0,
+                resumed_at: 0,
+                reconnects: 0,
+                elapsed_ms: 0,
+                log: [] }
+        Some(c) =>
+            var rec = st
+            if rec.hash != c.hex or rec.mode != mode_number(plan.mode)
+                rec.hash = c.hex
+                rec.mode = mode_number(plan.mode)
+                rec.stage = stage_number(Stage.Inspect)
+                rec.reset_sent = false
+            let r = Run { stage: Stage.Inspect,
+                reset_sent: rec.reset_sent,
+                reset_at: start,
+                worked: false,
+                uploads: 0,
+                fails: 0,
+                requests: 0,
+                resumed_at: 0,
+                reconnects: 0,
+                old_version: "",
+                log: [],
+                outcome: Outcome.Failed,
+                code: 0,
+                why: "the run took more than ${MAX_STEPS} steps",
+                finished: false }
+            var run = r
+            var seen = false
+            for _s in 0..MAX_STEPS
+                if run.finished
+                    break
+                if run.reset_sent and clk.now_ms() - run.reset_at > plan.wait_ms
+                    finish(run, Outcome.NeverReturned, 0,
+                        "the device did not come back within ${plan.wait_ms} ms of the restart")
+                    break
+                if run.reset_sent and t.lost()
+                    if not reconnect(t,
+                        run,
+                        plan,
+                        clk,
+                        least(plan.link_ms, plan.wait_ms - (clk.now_ms() - run.reset_at)))
+                        clk.sleep_ms(plan.poll_ms)
+                        continue
+                match smpapi.image_list(t, plan.call)
+                    Err(x)    =>
+                        let _ = recover(t, run, plan, clk, x.code, "reading the image list")
+                    Ok(slots) =>
+                        run.fails = 0
+                        if not seen
+                            seen = true
+                            match running_of(slots)
+                                Some(cur) =>
+                                    run.old_version = cur.version
+                                None      => ()
+                            note(run,
+                                st,
+                                j,
+                                Stage.Inspect,
+                                "the device runs ${run.old_version}, the candidate is ${c.version}")
+                        act(t, file, c, slots, plan, st, run, p, j, clk)
+            if run.finished and run.outcome == Outcome.Done
+                note(run, st, j, Stage.Done, run.why)
+            return Report { outcome: run.outcome,
+                stage: run.stage,
+                code: run.code,
+                why: run.why,
+                old_version: run.old_version,
+                new_version: c.version,
+                requests: run.requests,
+                resumed_at: run.resumed_at,
+                reconnects: run.reconnects,
+                elapsed_ms: clk.now_ms() - start,
+                log: run.log[:] }

@@ -1,0 +1,111 @@
+// smpdirect: the device of smpdevice.nv as a `Transport` and a `Reopen` in the same process.
+//
+// A packet sent goes to the device's session at once and its response waits for `recv`.  Nothing is opened and no time passes.  The link
+// ends when the device starts (a reset request is answered first and then the device restarts, as on a board), and a suite can end it
+// at a request of its choice: before the device sees the request, or after it has handled it and before its response is read.  A request is
+// counted from the first one sent, over every link the transport has had.  `reopen` makes the link again, after the device has been off the
+// air for the attempts that `smpdevice.set_off` gave.
+
+use std.bytes
+use smpdevice
+use smptransport
+
+// What a `Direct` link keeps.  A struct is a reference, so the methods, whose receiver is by value, change it through a local `var`.
+struct DState
+    var lost: Bool
+    var total: Int
+    var cut_before: Int
+    var cut_after: Int
+    var inbox: [Bytes]
+    var opens: Int
+    var reopen_calls: Int
+
+// A transport to the device in the same process.
+pub struct Direct
+    st: DState
+
+// A transport to the device, with the link up and no cut set.
+pub @tier(app)
+fn direct() -> Direct
+    Direct { st: DState { lost: false,
+        total: 0,
+        cut_before: 0,
+        cut_after: 0,
+        inbox: [],
+        opens: 1,
+        reopen_calls: 0 } }
+
+impl Direct
+    // The link ends before the device sees the `k`th request (counted from 1 over every link; 0: never).  The cut is used once.
+    @tier(app)
+    fn cut_before(self, k: Int) [mutate]
+        var st = self.st
+        st.cut_before = k
+
+    // The device handles the `k`th request and the link ends before its response is read.  The cut is used once.
+    @tier(app)
+    fn cut_after(self, k: Int) [mutate]
+        var st = self.st
+        st.cut_after = k
+
+    // The requests sent over every link, those refused included.
+    @tier(app)
+    fn total(self) -> Int
+        self.st.total
+
+    // The links the transport has had: 1 when it was never opened again.
+    @tier(app)
+    fn opens(self) -> Int
+        self.st.opens
+
+    // The calls of `reopen`, those that failed included.
+    @tier(app)
+    fn reopen_calls(self) -> Int
+        self.st.reopen_calls
+
+impl Transport[mutate] for Direct
+    @tier(app)
+    fn send(self, packet: Bytes) -> Bool [mutate]
+        var st = self.st
+        if st.lost
+            return false
+        st.total = st.total + 1
+        if st.total == st.cut_before
+            st.cut_before = 0
+            st.lost = true
+            return false
+        let r = smpdevice.serve(packet)
+        if bytes.len(r) > 0
+            list.push(st.inbox, bytes.clone(r))
+        if st.total == st.cut_after
+            st.cut_after = 0
+            st.lost = true
+            st.inbox = []
+        if smpdevice.take_restart()
+            st.lost = true
+        true
+
+    @tier(app)
+    fn recv(self, ms: Int) -> ?Bytes [mutate]
+        var st = self.st
+        if list.len(st.inbox) == 0
+            return None
+        let p = st.inbox[0]
+        st.inbox = st.inbox[1:list.len(st.inbox)]
+        Some(p)
+
+impl Reopen[mutate] for Direct
+    @tier(app)
+    fn lost(self) -> Bool
+        self.st.lost
+
+    @tier(app)
+    fn reopen(self, ms: Int) -> Bool [mutate]
+        var st = self.st
+        st.reopen_calls = st.reopen_calls + 1
+        if smpdevice.take_off()
+            return false
+        st.lost = false
+        st.inbox = []
+        st.opens = st.opens + 1
+        true

@@ -1,0 +1,194 @@
+// proof_tests: the upgrade flow over the GATT transport, against the real server of mcumgr-nv, with no radio.
+//
+//   novo test tests/proof_tests.nv
+//
+// What is real in this suite: the flow (smpflow.nv), the transport over a Central (smpgatt.nv), the session and the reassembly of the
+// requests, the image group of mcumgr-nv's server, the slot writer and the start-up rule of novoboot over RAM slots.  What is a model: the
+// Central, which is the scripted double of ble-central-nv with a device behind it that turns each write to the SMP characteristic into the
+// notifications of the server's response (smpdevice.nv), and the clock, which is a manual one.  A radio, an ATT bearer, a connection
+// interval and a phone's Bluetooth stack are not in it.
+
+use std.test
+use std.bytes
+use smpdevice
+use smpgatt
+use smpflow
+use smpapi
+
+let V1 = 0x01000000
+let V2 = 0x02000000
+
+fn call_opts() -> CallOptions
+    smpapi.options(50, 3)
+
+fn silent() -> Silent
+    Silent { id: 0 }
+
+fn quiet() -> Quiet
+    Quiet { id: 0 }
+
+fn hex_of(img: Bytes) -> Str
+    bytes.to_hex(smpapi.expected_hash(img))
+
+// A device at 1.0.0 behind a Central, and the image 2.0.0 for it.
+fn setup(mtu: Int) -> Periph [mutate]
+    smpdevice.fresh(V1)
+    let p = smpdevice.periph()
+    p.double().set_mtu_limit(mtu)
+    p
+
+fn record_of(img: Bytes, mode: Mode) -> FlowState
+    match smpflow.candidate(img)
+        Some(c) => smpflow.new_state(c, mode)
+        None    => FlowState { hash: "", mode: 0, stage: 0, reset_sent: false }
+
+// Runs the flow to `img` over the SMP service of the device `p` models.  Answers None when the service cannot be opened.
+fn upgrade(p: Periph, img: Bytes, mode: Mode, clk: Manual) -> ?Report [io, fs, net, mutate, time]
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(_)   => None
+        Ok(link) =>
+            Some(smpflow.run(link,
+                img,
+                smpflow.plan(mode, call_opts()),
+                record_of(img, mode),
+                silent(),
+                quiet(),
+                clk))
+
+fn outcome_of(r: ?Report) -> Outcome
+    match r
+        Some(rep) => rep.outcome
+        None      => Outcome.Failed
+
+@test
+fn test_an_upgrade_runs_over_the_service_at_every_write_size() [io, fs, net, mutate, time]
+    for mtu in [23, 188, 247]
+        let p = setup(mtu)
+        let img = smpdevice.image_of(V2, 3000, 4)
+        match upgrade(p, img, Mode.TestAndConfirm, smpflow.manual())
+            None      => test.fail("the service did not open at an MTU of ${mtu}")
+            Some(rep) =>
+                test.assert(rep.outcome == Outcome.Done)
+                test.assert_eq(rep.old_version, "1.0.0")
+                test.assert_eq(rep.new_version, "2.0.0")
+                test.assert_eq(rep.reconnects, 1)
+                test.assert_eq(smpdevice.running_hash(), hex_of(img))
+                test.assert(smpdevice.running_confirmed())
+                test.assert_eq(smpdevice.restarts(), 1)
+                test.assert(rep.requests >= 7)
+
+@test
+fn test_the_modes_end_as_the_device_is_asked_over_the_air() [io, fs, net, mutate, time]
+    test.case("confirm only")
+    var p = setup(247)
+    var img = smpdevice.image_of(V2, 1500, 5)
+    test.assert(outcome_of(upgrade(p, img, Mode.ConfirmOnly, smpflow.manual())) == Outcome.Done)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+    test.assert(smpdevice.running_confirmed())
+
+    test.case("test only")
+    p = setup(247)
+    img = smpdevice.image_of(V2, 1500, 6)
+    test.assert(outcome_of(upgrade(p, img, Mode.TestOnly, smpflow.manual())) == Outcome.Done)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+    test.assert(not smpdevice.running_confirmed())
+
+@test
+fn test_a_link_that_drops_after_any_write_of_the_first_connection_is_made_again() [io, fs, net, mutate, time]
+    for k in 1..61
+        test.case("the link drops after write ${k}")
+        let p = setup(23)
+        let img = smpdevice.image_of(V2, 1000, 7)
+        p.cut_at(k)
+        match upgrade(p, img, Mode.TestAndConfirm, smpflow.manual())
+            None      => test.fail("the service did not open")
+            Some(rep) =>
+                test.assert(rep.outcome == Outcome.Done)
+                test.assert_eq(smpdevice.running_hash(), hex_of(img))
+                test.assert(smpdevice.running_confirmed())
+
+@test
+fn test_an_upload_cut_late_resumes_over_the_air() [io, fs, net, mutate, time]
+    let p = setup(23)
+    let img = smpdevice.image_of(V2, 4000, 8)
+    p.cut_at(200)
+    match upgrade(p, img, Mode.TestAndConfirm, smpflow.manual())
+        None      => test.fail("the service did not open")
+        Some(rep) =>
+            test.assert(rep.outcome == Outcome.Done)
+            test.assert(rep.resumed_at > 832)
+            test.assert(rep.reconnects >= 2)
+
+@test
+fn test_an_image_that_hangs_is_reverted_and_the_flow_says_so_over_the_air() [io, fs, net, mutate, time]
+    let p = setup(247)
+    let old = smpdevice.running_hash()
+    smpdevice.set_hang(true)
+    let img = smpdevice.image_of(V2, 1500, 9)
+    match upgrade(p, img, Mode.TestAndConfirm, smpflow.manual())
+        None      => test.fail("the service did not open")
+        Some(rep) =>
+            test.assert(rep.outcome == Outcome.Reverted)
+            test.assert_eq(smpdevice.running_hash(), old)
+            test.assert_eq(smpdevice.restarts(), 2)
+
+@test
+fn test_a_device_that_is_off_the_air_for_a_while_after_the_restart_is_waited_for() [io, fs, net, mutate, time]
+    let p = setup(247)
+    let img = smpdevice.image_of(V2, 1500, 10)
+    let clk = smpflow.manual()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(_)   => test.fail("the service did not open")
+        Ok(link) =>
+            smpdevice.set_off(5)
+            let rep = smpflow.run(link,
+                img,
+                smpflow.plan(Mode.TestAndConfirm, call_opts()),
+                record_of(img, Mode.TestAndConfirm),
+                silent(),
+                quiet(),
+                clk)
+            test.assert(rep.outcome == Outcome.Done)
+            test.assert(clk.slept() >= 500 + 1000 + 2000 + 4000)
+
+    test.case("a device that never comes back")
+    let q = setup(247)
+    let img2 = smpdevice.image_of(V2, 1500, 11)
+    let clk2 = smpflow.manual()
+    match smpgatt.open(q, smpdevice.periph_peer(), smpgatt.options())
+        Err(_)   => test.fail("the service did not open")
+        Ok(link) =>
+            smpdevice.set_off(1000000)
+            let rep = smpflow.run(link,
+                img2,
+                smpflow.plan(Mode.TestAndConfirm, call_opts()),
+                record_of(img2, Mode.TestAndConfirm),
+                silent(),
+                quiet(),
+                clk2)
+            test.assert(rep.outcome == Outcome.NeverReturned)
+            test.assert(rep.elapsed_ms >= 120000)
+
+@test
+fn test_a_lost_notification_and_a_late_response_cost_requests_and_not_the_upgrade() [io, fs, net, mutate, time]
+    test.case("the first response is lost in two pieces")
+    var p = setup(23)
+    var img = smpdevice.image_of(V2, 1500, 12)
+    p.split_next([5])
+    p.lose_piece(1)
+    test.assert(outcome_of(upgrade(p, img, Mode.TestAndConfirm, smpflow.manual())) == Outcome.Done)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+
+    test.case("the first response is late")
+    p = setup(247)
+    img = smpdevice.image_of(V2, 1500, 13)
+    p.hold_next()
+    test.assert(outcome_of(upgrade(p, img, Mode.TestAndConfirm, smpflow.manual())) == Outcome.Done)
+    test.assert_eq(smpdevice.running_hash(), hex_of(img))
+
+@test
+fn test_a_service_that_cannot_be_opened_is_the_callers_to_report() [io, fs, net, mutate, time]
+    let p = setup(247)
+    p.double().refuse("subscribe", 5)
+    let img = smpdevice.image_of(V2, 300, 14)
+    test.assert(upgrade(p, img, Mode.TestAndConfirm, smpflow.manual()) == None)
