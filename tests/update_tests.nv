@@ -342,7 +342,12 @@ fn test_the_serial_ports_of_usb_boards_are_listed() [io, fs]
     test.assert_eq(update.ports_of(all, by_vendor).len(), 2)
     let other_vendor = update.Board { name: "d", vendor: "9999", probes: [], serial: "nope", slot_b: 0, data: 0 }
     test.assert_eq(update.ports_of(all, other_vendor).len(), 3)
-    let by_id = update.Board { name: "d", vendor: "1366", probes: ["1366:1025"], serial: "", slot_b: 0, data: 0 }
+    let by_id = update.Board { name: "d",
+        vendor: "1366",
+        probes: ["1366:1025"],
+        serial: "",
+        slot_b: 0,
+        data: 0 }
     test.assert_eq(update.ports_of(all, by_id).len(), 1)
     test.assert_eq(update.ports_of(all, by_id)[0].path, "${dev}/ttyACM0")
     let anyone = update.Board { name: "", vendor: "", probes: [], serial: "", slot_b: 0, data: 0 }
@@ -384,7 +389,8 @@ fn test_steps_run_against_a_server_until_one_fails() [io, fs, mutate]
     let _ = fs.delete(back)
 
     test.case("the first step that fails ends the run")
-    let steps = [update.Step { words: ["image", "test", "zz"], image: 0 }, update.Step { words: ["list"], image: 0 }]
+    let steps = [update.Step { words: ["image", "test", "zz"], image: 0 },
+        update.Step { words: ["list"], image: 0 }]
     test.assert_eq(update.execute(lp(), steps, 100, 1), EINVAL)
     test.assert_eq(update.execute(lp(), [], 100, 1), 0)
     let _ = fs.delete(file)
@@ -427,8 +433,12 @@ fn test_a_command_that_cannot_run_is_a_usage_error_and_says_so() [io, fs, net, t
     test.assert(fs.set_file_mode(spaced, 0o755))
     process.env_set("NOVO", spaced)
     let canary = tmp("canary")
-    test.assert_eq(update.run_in(["--target", "demo", "--tcp", "127.0.0.1:1", "--timeout", "50", "--tries", "1", "list"], sys, dev), 3)
-    test.assert_eq(update.run_in(["--target", "demo; touch ${canary}", "--tcp", "127.0.0.1:1", "list"], sys, dev), 2)
+    test.assert_eq(update.run_in(["--target", "demo", "--tcp", "127.0.0.1:1", "--timeout", "50", "--tries", "1", "list"],
+        sys,
+        dev),
+    3)
+    test.assert_eq(update.run_in(["--target", "demo; touch ${canary}", "--tcp", "127.0.0.1:1", "list"], sys, dev),
+        2)
     test.assert_eq(update.run_in(["--target=", "--tcp", "127.0.0.1:1", "list"], sys, dev), 3)
     test.assert(not fs.exists(canary))
     process.env_set("NOVO", "")
@@ -446,7 +456,8 @@ fn test_the_scan_lists_ports_and_devices() [io, fs, net, time, mutate]
     test.assert_eq(update.run_in(["scan"], sys, dev), 0)
 
     test.case("the devices that advertise the service, from the relay")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_scan", "echo 'NovoFOTA 00:11:22:33:44:AA -52'; echo 'NovoFOTA 00:11:22:33:44:BB -60'; echo; echo 'quiet one'"))
+    process.env_set("NOVO_UPDATE_BLE", script("relay_scan",
+        "echo 'NovoFOTA 00:11:22:33:44:AA -52'; echo 'NovoFOTA 00:11:22:33:44:BB -60'; echo; echo 'quiet one'"))
     test.assert_eq(update.run_in(["scan", "--ble"], sys, dev), 0)
     process.env_set("NOVO_UPDATE_BLE", script("relay_none", "exit 0"))
     test.assert_eq(update.run_in(["scan", "--ble"], sys, dev), 3)
@@ -511,7 +522,8 @@ fn test_a_socket_is_reached_and_closed() [io, fs, net, time, mutate]
         None      => test.assert(false)
         Some(pid) =>
             time.sleep(1.0)
-            test.assert_eq(update.run_in(["--tcp", "127.0.0.1:${port}", "--timeout", "2000", "--tries", "1", "list"], sys, dev), 0)
+            test.assert_eq(update.run_in(["--tcp", "127.0.0.1:${port}", "--timeout", "2000", "--tries", "1", "list"], sys, dev),
+                0)
             proc.close(pid)
     let _ = fs.delete(echo)
 
@@ -526,11 +538,13 @@ fn test_a_relay_carries_the_packets_of_an_update_and_the_restart_is_waited_for()
     test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
 
     test.case("a device found by the scan is the one used")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_one", "if [ \"$2\" = scan ]; then echo 'NovoFOTA 00:11:22:33:44:AA -52'; else exec cat; fi"))
+    process.env_set("NOVO_UPDATE_BLE", script("relay_one",
+        "if [ \"$2\" = scan ]; then echo 'NovoFOTA 00:11:22:33:44:AA -52'; else exec cat; fi"))
     test.assert_eq(update.run_in(["--ble", "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
 
     test.case("two devices: the user chooses; none: nothing to update")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_two", "echo 'A 00:11:22:33:44:AA -52'; echo 'B 00:11:22:33:44:BB -60'"))
+    process.env_set("NOVO_UPDATE_BLE",
+        script("relay_two", "echo 'A 00:11:22:33:44:AA -52'; echo 'B 00:11:22:33:44:BB -60'"))
     test.assert_eq(update.run_in(["--ble", "list"], sys, dev), 3)
     process.env_set("NOVO_UPDATE_BLE", script("relay_nobody", "exit 0"))
     test.assert_eq(update.run_in(["--ble", "list"], sys, dev), 3)
@@ -539,15 +553,23 @@ fn test_a_relay_carries_the_packets_of_an_update_and_the_restart_is_waited_for()
     process.env_set("NOVO_UPDATE_BLE", script("relay_echo2", "exec cat"))
     let file = tmp("flow.img")
     put(file, image(0x01020003, 300, 5))
-    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "--wait", "3", "--test", "--confirm", file], sys, dev), 0)
-    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "--test", file], sys, dev), 0)
+    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "--wait", "3", "--test", "--confirm", file],
+        sys,
+        dev),
+    0)
+    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "--test", file], sys, dev),
+        0)
     let _ = fs.delete(file)
 
     test.case("a board that does not come back")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_once", "if [ -e ${tmp("relay_once.seen")} ]; then exit 0; fi; : > ${tmp("relay_once.seen")}; exec cat"))
+    process.env_set("NOVO_UPDATE_BLE", script("relay_once",
+        "if [ -e ${tmp("relay_once.seen")} ]; then exit 0; fi; : > ${tmp("relay_once.seen")}; exec cat"))
     let again = tmp("again.img")
     put(again, image(0x01020003, 100, 6))
-    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "300", "--tries", "1", "--wait", "1", "--test", "--confirm", again], sys, dev), 3)
+    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "300", "--tries", "1", "--wait", "1", "--test", "--confirm", again],
+        sys,
+        dev),
+    3)
     let _ = fs.delete(again)
 
     test.case("a relay that cannot start")
@@ -565,11 +587,13 @@ fn test_the_relay_is_found_beside_the_toolchain() [io, fs, net, time, mutate]
     test.assert(fs.write("${bin}/novo-update-ble", "#!/bin/sh\nexec cat\n"))
     test.assert(fs.set_file_mode("${bin}/novo-update-ble", 0o755))
     process.env_set("NOVO", "${bin}/novo")
-    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
+    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev),
+        0)
 
     test.case("without one beside it the name is looked up on PATH, and nothing there is nothing to run")
     process.env_set("NOVO", "${tmp("elsewhere")}/novo")
-    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev), 3)
+    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev),
+        3)
     process.env_set("NOVO", "")
 
 @test
@@ -591,7 +615,8 @@ fn test_the_toolchain_and_the_socket_have_defaults() [io, fs, net, time, mutate]
     let log = tmp("socket.log")
     process.env_set("NOVO_HCI_SOCKET", "/tmp/a_bridge.sock")
     process.env_set("NOVO_UPDATE_BLE", script("relay_socket", "echo \"$1\" >> ${log}; exec cat"))
-    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
+    test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev),
+        0)
     test.assert(str.contains(fs.read_or(log, ""), "/tmp/a_bridge.sock"))
     process.env_set("NOVO_HCI_SOCKET", "")
     process.env_set("NOVO_UPDATE_BLE", "")

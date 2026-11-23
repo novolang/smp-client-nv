@@ -27,8 +27,8 @@ use smpflash.{ RamBlocks }
 
 let TOTAL = 32768
 
-var s   = smpstate.session()
-var ram = bootram.ram_slots(256, 64)
+var s                      = smpstate.session()
+var ram                    = bootram.ram_slots(256, 64)
 var vol: Volume<RamBlocks> = nvfs.mount_with(smpflash.ram_blocks(), nvfs.default_config(), true)
 
 fn fresh() [mutate]
@@ -166,4 +166,3 @@ fn test_the_client_sends_a_data_image_and_asks_about_files() [io, fs, net, mutat
     test.assert_eq(smpcli.words(args).len(), 3)
     let _ = fs.delete(src_file)
     let _ = fs.delete(small)
-

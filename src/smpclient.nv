@@ -46,8 +46,8 @@ fn code_of_slots(r: Result<[Slot], SmpError>) -> Int [io]
         Err(e)    => e.code
 
 // Prints `echo`'s answer.
-@tier(app)
-pub fn echo<T: Transport[e]>(w: T, text: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn echo<T: Transport[e]>(w: T, text: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
     match smpapi.echo(w, text, smpapi.options(ms, tries))
         Ok(back) =>
             println(back)
@@ -55,8 +55,8 @@ pub fn echo<T: Transport[e]>(w: T, text: Str, ms: Int, tries: Int) -> Int [io, e
         Err(e)   => e.code
 
 // Prints the parameters of the server.
-@tier(app)
-pub fn params<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn params<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [io, e, mutate]
     match smpapi.params(w, smpapi.options(ms, tries))
         Ok(p)  =>
             println("buf_size ${p.buf_size} buf_count ${p.buf_count}")
@@ -64,37 +64,40 @@ pub fn params<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [io, e, mutate]
         Err(e) => e.code
 
 // Asks the server to reset.
-@tier(app)
-pub fn reset<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
+pub @tier(app)
+fn reset<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
     code_of_unit(smpapi.reset(w, smpapi.options(ms, tries)))
 
 // Prints the image list.
-@tier(app)
-pub fn image_list<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn image_list<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [io, e, mutate]
     code_of_slots(smpapi.image_list(w, smpapi.options(ms, tries)))
 
 // Marks the image whose hash is `hash` for a test at the next start, or confirms it (`hash` empty confirms the image that runs).
-@tier(app)
-pub fn image_state<T: Transport[e]>(w: T, hash: Bytes, confirm: Bool, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn image_state<T: Transport[e]>(w: T, hash: Bytes, confirm: Bool, ms: Int,
+                                tries: Int) -> Int [io, e, mutate]
     if confirm
         return code_of_slots(smpapi.image_confirm(w, hash, smpapi.options(ms, tries)))
     code_of_slots(smpapi.image_test(w, hash, smpapi.options(ms, tries)))
 
 // Erases the second slot.
-@tier(app)
-pub fn image_erase<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
+pub @tier(app)
+fn image_erase<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
     code_of_unit(smpapi.image_erase(w, smpapi.options(ms, tries)))
 
 // Uploads the image `file`, a NOVB image or a package, a request at a time.  `chunk` is the most bytes of the file in a request, 0 for
 // the most the buffer holds.  Answers 0, the server's code, or a negative code.  The list is not read afterwards: the next step of a
 // flow, `test HASH`, is refused by a server that holds no image with that hash, and `smpapi.image_upload` is the call that checks.
-@tier(app)
-pub fn image_upload<T: Transport[e]>(w: T, file: Bytes, chunk: Int, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn image_upload<T: Transport[e]>(w: T, file: Bytes, chunk: Int, ms: Int,
+                                 tries: Int) -> Int [io, e, mutate]
     image_upload_to(w, 0, file, chunk, ms, tries)
 
 // `image_upload` for the image `image`: 0 is the firmware, 1 the data region, whose file is the one `novofs-tools mk --target` wrote.
-@tier(app)
-pub fn image_upload_to<T: Transport[e]>(w: T, image: Int, file: Bytes, chunk: Int, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn image_upload_to<T: Transport[e]>(w: T, image: Int, file: Bytes, chunk: Int, ms: Int,
+                                    tries: Int) -> Int [io, e, mutate]
     let o = smpapi.with_chunk(smpapi.options(ms, tries), chunk)
     match smpapi.image_upload_to(w, image, file, o, Silent { id: 0 })
         Ok(u)  =>
@@ -103,13 +106,14 @@ pub fn image_upload_to<T: Transport[e]>(w: T, image: Int, file: Bytes, chunk: In
         Err(e) => e.code
 
 // Uploads `file` as the file `name` of the server.
-@tier(app)
-pub fn fs_upload<T: Transport[e]>(w: T, name: Str, file: Bytes, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn fs_upload<T: Transport[e]>(w: T, name: Str, file: Bytes, ms: Int,
+                              tries: Int) -> Int [io, e, mutate]
     code_of_unit(smpapi.fs_upload(w, name, file, smpapi.options(ms, tries), Silent { id: 0 }))
 
 // Prints the length of the file `name` of the server.
-@tier(app)
-pub fn fs_status<T: Transport[e]>(w: T, name: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn fs_status<T: Transport[e]>(w: T, name: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
     match smpapi.fs_status(w, name, smpapi.options(ms, tries))
         Ok(n)  =>
             println("${name}: ${n} bytes")
@@ -117,8 +121,8 @@ pub fn fs_status<T: Transport[e]>(w: T, name: Str, ms: Int, tries: Int) -> Int [
         Err(e) => e.code
 
 // Prints the CRC-32 of the file `name` of the server, as eight hexadecimal digits.
-@tier(app)
-pub fn fs_hash<T: Transport[e]>(w: T, name: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
+pub @tier(app)
+fn fs_hash<T: Transport[e]>(w: T, name: Str, ms: Int, tries: Int) -> Int [io, e, mutate]
     match smpapi.fs_hash(w, name, smpapi.options(ms, tries))
         Err(e) => e.code
         Ok(h)  =>
@@ -133,13 +137,14 @@ pub fn fs_hash<T: Transport[e]>(w: T, name: Str, ms: Int, tries: Int) -> Int [io
             0
 
 // Asks the server to close the files of a transfer that stalled.
-@tier(app)
-pub fn fs_close<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
+pub @tier(app)
+fn fs_close<T: Transport[e]>(w: T, ms: Int, tries: Int) -> Int [e, mutate]
     code_of_unit(smpapi.fs_close(w, smpapi.options(ms, tries)))
 
 // Downloads the file `name` of the server and writes the bytes to `path`.
-@tier(app)
-pub fn fs_download<T: Transport[e]>(w: T, name: Str, path: Str, ms: Int, tries: Int) -> Int [io, fs, e, mutate]
+pub @tier(app)
+fn fs_download<T: Transport[e]>(w: T, name: Str, path: Str, ms: Int,
+                                tries: Int) -> Int [io, fs, e, mutate]
     match smpapi.fs_download(w, name, smpapi.options(ms, tries), Silent { id: 0 })
         Err(e)   => e.code
         Ok(data) =>

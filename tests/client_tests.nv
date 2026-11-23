@@ -207,7 +207,8 @@ fn test_a_package_and_a_file_travel_whole() [io, fs, mutate]
     let nothing = tmp("none")
     test.assert_eq(smpclient.fs_download(lp(), "/empty", nothing, 100, 1), 0)
     test.assert_eq(smpclient.fs_download(lp(), "/absent", nothing, 100, 1), ENOENT)
-    test.assert_eq(smpclient.fs_upload(lp(), "/big", payload(mcumgr_nv.CONFIG.MAX_FILE_BYTES + 1, 1), 100, 1), EMSGSIZE)
+    test.assert_eq(smpclient.fs_upload(lp(), "/big", payload(mcumgr_nv.CONFIG.MAX_FILE_BYTES + 1, 1), 100, 1),
+        EMSGSIZE)
     test.assert_eq(smpclient.fs_download(lp(), "/empty", "/nonexistent-dir/x", 100, 1), EUNKNOWN)
     let _ = fs.delete(nothing)
 
@@ -317,7 +318,7 @@ fn test_a_tcp_wire_reads_what_the_peer_sends() [io, fs, net, mutate]
         Some(server) =>
             let port = net.local_port(server)
             match smptransport.connect("127.0.0.1", port, 1000)
-                None       => test.assert(false)
+                None         => test.assert(false)
                 Some(framed) =>
                     let wire = framed.wire
                     match net.accept(server)
@@ -504,7 +505,8 @@ fn test_the_program_reaches_a_serial_port_and_a_pipe() [io, fs, net, mutate]
     let old = process.env("PATH") ?? ""
     process.env_set("PATH", "${bin}:${old}")
     // /dev/null reads as the end of a stream: the command is not answered.
-    test.assert_eq(smpcli.run(["--serial", "/dev/null", "--baud", "9600", "--timeout", "50", "--tries", "1", "echo", "x"]), 3)
+    test.assert_eq(smpcli.run(["--serial", "/dev/null", "--baud", "9600", "--timeout", "50", "--tries", "1", "echo", "x"]),
+        3)
     test.assert_eq(smpcli.run(["--serial", "/dev/no-such-port", "echo", "x"]), 3)
     process.env_set("PATH", old)
 

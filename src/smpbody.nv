@@ -118,8 +118,8 @@ fn skip(p: Bytes, at: Int, depth: Int) -> Int
 
 // Whether `p` is a response packet: a header the protocol defines, a body of the length the header names, and a body that is one
 // definite CBOR map whose every item is whole.
-@tier(app)
-pub fn valid(p: Bytes) -> Bool
+pub @tier(app)
+fn valid(p: Bytes) -> Bool
     let n = bytes.len(p)
     if n < SMP_HDR_BYTES
         return false
@@ -135,15 +135,15 @@ pub fn valid(p: Bytes) -> Bool
     skip(p, SMP_HDR_BYTES, 0) == n
 
 // The sequence number of the packet's header, or -1 when it holds no header.
-@tier(app)
-pub fn seq_of(p: Bytes) -> Int
+pub @tier(app)
+fn seq_of(p: Bytes) -> Int
     if bytes.len(p) < SMP_HDR_BYTES
         return 0 - 1
     bytes.byte_at(p, 6) ?? 0
 
 // The value under `key` in the map that starts at `at`.
-@tier(app)
-pub fn find(p: Bytes, at: Int, key: Str) -> Val
+pub @tier(app)
+fn find(p: Bytes, at: Int, key: Str) -> Val
     let none = Val { found: false, major: 0, arg: 0, at: 0, head: 0 }
     let m = head_at(p, at)
     if not m.ok or m.major != 5 or m.arg > MAX_ITEMS
@@ -169,43 +169,43 @@ fn text_is(p: Bytes, at: Int, n: Int, key: Str) -> Bool
     if str.len(key) != n
         return false
     for i in 0..n
-        if (bytes.byte_at(p, at + i) ?? (0 - 1)) != str.byte_at_or(key, i, 0 - 2)
+        if (bytes.byte_at(p, at + i) ?? 0 - 1) != str.byte_at_or(key, i, 0 - 2)
             return false
     true
 
 // The unsigned number under `key` of the body, or `fallback`.
-@tier(app)
-pub fn uint(p: Bytes, key: Str, fallback: Int) -> Int
+pub @tier(app)
+fn uint(p: Bytes, key: Str, fallback: Int) -> Int
     let v = find(p, SMP_HDR_BYTES, key)
     if v.found and v.major == T_UINT
         return v.arg
     fallback
 
 // The text under `key` of the body, "" when there is none.
-@tier(app)
-pub fn text(p: Bytes, key: Str) -> Str
+pub @tier(app)
+fn text(p: Bytes, key: Str) -> Str
     let v = find(p, SMP_HDR_BYTES, key)
     if not v.found or v.major != T_TEXT
         return ""
     bytes.to_str(bytes.slice(p, v.at, v.at + v.arg))
 
 // The byte string under `key` of the body, empty when there is none.
-@tier(app)
-pub fn bytes_of(p: Bytes, key: Str) -> Bytes
+pub @tier(app)
+fn bytes_of(p: Bytes, key: Str) -> Bytes
     let v = find(p, SMP_HDR_BYTES, key)
     if not v.found or v.major != T_BYTES
         return bytes.zeros(0)
     bytes.slice(p, v.at, v.at + v.arg)
 
 // Whether the body holds a byte string under `key`.
-@tier(app)
-pub fn has_bytes(p: Bytes, key: Str) -> Bool
+pub @tier(app)
+fn has_bytes(p: Bytes, key: Str) -> Bool
     let v = find(p, SMP_HDR_BYTES, key)
     v.found and v.major == T_BYTES
 
 // The code a response carries: the top-level `rc`, else the `rc` of the `err` map, else 0.
-@tier(app)
-pub fn rc_of(p: Bytes) -> Int
+pub @tier(app)
+fn rc_of(p: Bytes) -> Int
     let top = uint(p, "rc", 0 - 1)
     if top >= 0
         return top
@@ -217,16 +217,16 @@ pub fn rc_of(p: Bytes) -> Int
     0
 
 // The unsigned number under `key` in the map that starts at `at`, or `fallback`.
-@tier(app)
-pub fn uint_in(p: Bytes, at: Int, key: Str, fallback: Int) -> Int
+pub @tier(app)
+fn uint_in(p: Bytes, at: Int, key: Str, fallback: Int) -> Int
     let v = find(p, at, key)
     if v.found and v.major == T_UINT
         return v.arg
     fallback
 
 // The boolean under `key` in the map that starts at `at`, or `fallback`.
-@tier(app)
-pub fn bool_in(p: Bytes, at: Int, key: Str, fallback: Bool) -> Bool
+pub @tier(app)
+fn bool_in(p: Bytes, at: Int, key: Str, fallback: Bool) -> Bool
     let v = find(p, at, key)
     if v.found and v.major == T_SIMPLE
         if v.arg == 21
@@ -236,6 +236,6 @@ pub fn bool_in(p: Bytes, at: Int, key: Str, fallback: Bool) -> Bool
     fallback
 
 // The position after the item that starts at `at` of a packet that passed `valid`.
-@tier(app)
-pub fn after(p: Bytes, at: Int) -> Int
+pub @tier(app)
+fn after(p: Bytes, at: Int) -> Int
     skip(p, at, 1)

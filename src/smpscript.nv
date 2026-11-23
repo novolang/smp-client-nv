@@ -47,13 +47,13 @@ pub struct Scripted
     st: State
 
 // A script with no steps, that accepts every write and reports no limit.
-@tier(app)
-pub fn scripted() -> Scripted
+pub @tier(app)
+fn scripted() -> Scripted
     Scripted { st: State { steps: [], sent: [], at: 0, refuse: 0, limit: 0 } }
 
 // The first `n` bytes of `b`, as a packet.
-@tier(app)
-pub fn packet_of(var b: SmpBuf, n: Int) -> Bytes [mutate]
+pub @tier(app)
+fn packet_of(var b: SmpBuf, n: Int) -> Bytes [mutate]
     var out: [Int] = []
     for i in 0..n
         list.push(out, b[i] as Int)

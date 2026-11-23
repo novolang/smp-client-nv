@@ -62,8 +62,8 @@ impl Error for SmpError
         "the server answered code ${self.code} (${code_name(self.code)})"
 
 // The name of a code the server answers.
-@tier(app)
-pub fn code_name(code: Int) -> Str
+pub @tier(app)
+fn code_name(code: Int) -> Str
     if code == EUNKNOWN
         return "unknown error"
     if code == ENOMEM
@@ -97,13 +97,13 @@ struct CallOptions
     chunk: Int
 
 // CallOptions that wait `ms` milliseconds for each of `tries` attempts and cut a file as large as the buffer and the transport allow.
-@tier(app)
-pub fn options(ms: Int, tries: Int) -> CallOptions
+pub @tier(app)
+fn options(ms: Int, tries: Int) -> CallOptions
     CallOptions { ms: ms, tries: tries, chunk: 0 }
 
 // `o` with a chunk of at most `chunk` bytes.
-@tier(app)
-pub fn with_chunk(o: CallOptions, chunk: Int) -> CallOptions
+pub @tier(app)
+fn with_chunk(o: CallOptions, chunk: Int) -> CallOptions
     CallOptions { ms: o.ms, tries: o.tries, chunk: chunk }
 
 // What a transfer tells its caller as it goes: `step` runs after each response, with the bytes done and the bytes in all (the
@@ -183,7 +183,8 @@ fn exchange<T: Transport[e]>(t: T, n: Int, o: CallOptions) -> Int [e, mutate]
             return E_SEND
         for _b in 0..200000
             match t.recv(o.ms)
-                None    => break
+                None    =>
+                    break
                 Some(p) =>
                     if smpbody.seq_of(p) == want
                         if smpbody.valid(p)
@@ -225,24 +226,25 @@ fn chunk_of<T: Transport[e]>(t: T, want: Int) -> Int [e, mutate]
     room
 
 // The answer of `echo`: the text the server sent back.
-@tier(app)
-pub fn echo<T: Transport[e]>(t: T, text: Str, o: CallOptions) -> Result<Str, SmpError> [e, mutate]
+pub @tier(app)
+fn echo<T: Transport[e]>(t: T, text: Str, o: CallOptions) -> Result<Str, SmpError> [e, mutate]
     let rc = code_of(t, smpreq.echo(var req, next_seq(), 0, text), o)
     if rc != 0
         return Err(fail(rc))
     Ok(smpbody.text(last, "r"))
 
 // The buffer the server reads a packet into, and how many of them it has.
-@tier(app)
-pub fn params<T: Transport[e]>(t: T, o: CallOptions) -> Result<Params, SmpError> [e, mutate]
+pub @tier(app)
+fn params<T: Transport[e]>(t: T, o: CallOptions) -> Result<Params, SmpError> [e, mutate]
     let rc = code_of(t, smpreq.params(var req, next_seq(), 0), o)
     if rc != 0
         return Err(fail(rc))
-    Ok(Params { buf_size: smpbody.uint(last, "buf_size", 0), buf_count: smpbody.uint(last, "buf_count", 0) })
+    Ok(Params { buf_size: smpbody.uint(last, "buf_size", 0),
+        buf_count: smpbody.uint(last, "buf_count", 0) })
 
 // Asks the server to reset.  The server answers first and resets after it.
-@tier(app)
-pub fn reset<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
+pub @tier(app)
+fn reset<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
     plain_result(t, smpreq.reset(var req, next_seq(), 0), o)
 
 // The images in the response held in `last`: none when the response has no `images`, which a server with no image may leave out.
@@ -276,7 +278,8 @@ fn slots_of_last() -> ?[Slot]
 
 // The result of a command that answers the image list.
 @tier(app)
-fn slots_result<T: Transport[e]>(t: T, n: Int, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
+fn slots_result<T: Transport[e]>(t: T, n: Int,
+                                 o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
     let rc = code_of(t, n, o)
     if rc != 0
         return Err(fail(rc))
@@ -285,30 +288,32 @@ fn slots_result<T: Transport[e]>(t: T, n: Int, o: CallOptions) -> Result<[Slot],
         Some(slots) => Ok(slots)
 
 // The images the server holds.
-@tier(app)
-pub fn image_list<T: Transport[e]>(t: T, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
+pub @tier(app)
+fn image_list<T: Transport[e]>(t: T, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
     slots_result(t, smpreq.image_list(var req, next_seq(), 0), o)
 
 // Marks the image whose hash is `hash` to run on trial at the next start, and answers the list the server then holds.
-@tier(app)
-pub fn image_test<T: Transport[e]>(t: T, hash: Bytes, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
+pub @tier(app)
+fn image_test<T: Transport[e]>(t: T, hash: Bytes,
+                               o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
     slots_result(t, smpreq.image_state(var req, next_seq(), 0, hash, false), o)
 
 // Confirms the image that runs, or, with the hash of the staged image, makes that one permanent.  `hash` empty confirms the
 // image that runs.
-@tier(app)
-pub fn image_confirm<T: Transport[e]>(t: T, hash: Bytes, o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
+pub @tier(app)
+fn image_confirm<T: Transport[e]>(t: T, hash: Bytes,
+                                  o: CallOptions) -> Result<[Slot], SmpError> [e, mutate]
     slots_result(t, smpreq.image_state(var req, next_seq(), 0, hash, true), o)
 
 // Erases the second slot.
-@tier(app)
-pub fn image_erase<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
+pub @tier(app)
+fn image_erase<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
     plain_result(t, smpreq.image_erase(var req, next_seq(), 0), o)
 
 // The hash an image carries, which the server lists once the image is staged: the 32 bytes at 0x20 of a NOVB image, or of the NOVB
 // image a package wraps.  Empty for a file that is neither, such as an image of another format, whose hash the client does not read.
-@tier(app)
-pub fn expected_hash(file: Bytes) -> Bytes
+pub @tier(app)
+fn expected_hash(file: Bytes) -> Bytes
     let img = smppack.unwrap(file)
     if bytes.len(img) < 0x40
         return bytes.zeros(0)
@@ -321,8 +326,9 @@ pub fn expected_hash(file: Bytes) -> Bytes
 // it expects next, and the upload goes on from there; so a first request that is answered with an offset above zero resumes an
 // upload an earlier call left, whatever the call.  `p` is told after each response.  The first request of a NOVB image or a
 // package carries the image's hash.  Nothing is checked after the last request: `image_upload` is the call that does.
-@tier(app)
-pub fn image_upload_to<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: Bytes, o: CallOptions, p: P) -> Result<Upload, SmpError> [e, f, mutate]
+pub @tier(app)
+fn image_upload_to<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: Bytes, o: CallOptions,
+                                                    p: P) -> Result<Upload, SmpError> [e, f, mutate]
     let total = bytes.len(file)
     var sha = bytes.zeros(0)
     if image == 0
@@ -352,8 +358,9 @@ pub fn image_upload_to<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: 
 
 // `image_upload_to` for the firmware, then a check that the server holds the image: its list must have an image whose hash is the
 // one the file carries.  A file with no hash to read (`expected_hash`) is not checked.  `E_HASH` when no listed image has it.
-@tier(app)
-pub fn image_upload<T: Transport[e], P: Progress[f]>(t: T, file: Bytes, o: CallOptions, p: P) -> Result<Upload, SmpError> [e, f, mutate]
+pub @tier(app)
+fn image_upload<T: Transport[e], P: Progress[f]>(t: T, file: Bytes, o: CallOptions,
+                                                 p: P) -> Result<Upload, SmpError> [e, f, mutate]
     match image_upload_to(t, 0, file, o, p)
         Err(e) => Err(e)
         Ok(u)  =>
@@ -361,8 +368,8 @@ pub fn image_upload<T: Transport[e], P: Progress[f]>(t: T, file: Bytes, o: CallO
             if want == ""
                 return Ok(u)
             match image_list(t, o)
-                Err(e)      => Err(e)
-                Ok(slots)   =>
+                Err(e)    => Err(e)
+                Ok(slots) =>
                     for s in slots
                         if bytes.to_hex(s.hash) == want
                             return Ok(u)
@@ -370,12 +377,13 @@ pub fn image_upload<T: Transport[e], P: Progress[f]>(t: T, file: Bytes, o: CallO
 
 // Uploads `file` as the file `name` of the server's volume.  The server gathers the file in memory and writes it when the last
 // chunk has arrived, so a transfer that stopped starts again from the first byte.
-@tier(app)
-pub fn fs_upload<T: Transport[e], P: Progress[f]>(t: T, name: Str, file: Bytes, o: CallOptions, p: P) -> Result<Unit, SmpError> [e, f, mutate]
+pub @tier(app)
+fn fs_upload<T: Transport[e], P: Progress[f]>(t: T, name: Str, file: Bytes, o: CallOptions,
+                                              p: P) -> Result<Unit, SmpError> [e, f, mutate]
     let total = bytes.len(file)
     var off = 0
     for _r in 0..total + 16
-        if off < total or (total == 0 and off == 0)
+        if off < total or total == 0 and off == 0
             var n = total - off
             let room = chunk_of(t, o.chunk) - str.len(name)
             if n > room
@@ -394,29 +402,31 @@ pub fn fs_upload<T: Transport[e], P: Progress[f]>(t: T, name: Str, file: Bytes, 
     Ok()
 
 // The length of the file `name`.
-@tier(app)
-pub fn fs_status<T: Transport[e]>(t: T, name: Str, o: CallOptions) -> Result<Int, SmpError> [e, mutate]
+pub @tier(app)
+fn fs_status<T: Transport[e]>(t: T, name: Str, o: CallOptions) -> Result<Int, SmpError> [e, mutate]
     let rc = code_of(t, smpreq.fs_status(var req, next_seq(), 0, name), o)
     if rc != 0
         return Err(fail(rc))
     Ok(smpbody.uint(last, "len", 0))
 
 // The CRC-32 of the file `name`.
-@tier(app)
-pub fn fs_hash<T: Transport[e]>(t: T, name: Str, o: CallOptions) -> Result<FileHash, SmpError> [e, mutate]
+pub @tier(app)
+fn fs_hash<T: Transport[e]>(t: T, name: Str,
+                            o: CallOptions) -> Result<FileHash, SmpError> [e, mutate]
     let rc = code_of(t, smpreq.fs_hash(var req, next_seq(), 0, name, "crc32", 0, 0 - 1), o)
     if rc != 0
         return Err(fail(rc))
     Ok(FileHash { crc32: smpbody.uint(last, "output", 0), len: smpbody.uint(last, "len", 0) })
 
 // Asks the server to close the files of a transfer that stalled.
-@tier(app)
-pub fn fs_close<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
+pub @tier(app)
+fn fs_close<T: Transport[e]>(t: T, o: CallOptions) -> Result<Unit, SmpError> [e, mutate]
     plain_result(t, smpreq.fs_close(var req, next_seq(), 0), o)
 
 // Downloads the file `name`.  The first response states the length; the requests go on until the bytes are all there.
-@tier(app)
-pub fn fs_download<T: Transport[e], P: Progress[f]>(t: T, name: Str, o: CallOptions, p: P) -> Result<Bytes, SmpError> [e, f, mutate]
+pub @tier(app)
+fn fs_download<T: Transport[e], P: Progress[f]>(t: T, name: Str, o: CallOptions,
+                                                p: P) -> Result<Bytes, SmpError> [e, f, mutate]
     var all: [Int] = []
     var off = 0
     var total = 0 - 1

@@ -46,16 +46,16 @@ fn usage() [io]
     eprintln("usage: smp-client-nv pack IMAGE -o PACKAGE | unpack PACKAGE -o IMAGE")
 
 // The value after flag `name`, or `fallback`.
-@tier(app)
-pub fn flag(args: [Str], name: Str, fallback: Str) -> Str
+pub @tier(app)
+fn flag(args: [Str], name: Str, fallback: Str) -> Str
     for i in 0..args.len()
         if args[i] == name and i + 1 < args.len()
             return args[i + 1]
     fallback
 
 // The arguments with the flags that take a value, and their values, removed.
-@tier(app)
-pub fn words(args: [Str]) -> [Str]
+pub @tier(app)
+fn words(args: [Str]) -> [Str]
     var out: [Str] = []
     var skip = false
     for a in args
@@ -68,8 +68,8 @@ pub fn words(args: [Str]) -> [Str]
     out
 
 // The bytes of the hex string, empty when it is not one.
-@tier(app)
-pub fn from_hex(s: Str) -> Bytes
+pub @tier(app)
+fn from_hex(s: Str) -> Bytes
     var out: [Int] = []
     if str.len(s) % 2 != 0
         return bytes.from_byte_list(out)
@@ -91,8 +91,8 @@ pub fn from_hex(s: Str) -> Bytes
     bytes.from_byte_list(out)
 
 // Writes `data` to the file `path`.
-@tier(app)
-pub fn write_file(path: Str, data: Bytes) -> Bool [fs]
+pub @tier(app)
+fn write_file(path: Str, data: Bytes) -> Bool [fs]
     var all: [Int] = []
     for i in 0..bytes.len(data)
         list.push(all, bytes.byte_at(data, i) ?? 0)
@@ -128,7 +128,8 @@ fn files(args: [Str], w: [Str]) -> Int [io, fs]
 
 // The upload of the file `path`.
 @tier(app)
-fn upload<T: Transport[e]>(wire: T, path: Str, image: Int, ms: Int, tries: Int) -> Int [io, fs, e, mutate]
+fn upload<T: Transport[e]>(wire: T, path: Str, image: Int, ms: Int,
+                           tries: Int) -> Int [io, fs, e, mutate]
     match fs.read_bytes(path)
         None    =>
             eprintln("smp-client-nv: cannot read ${path}")
@@ -139,7 +140,7 @@ fn upload<T: Transport[e]>(wire: T, path: Str, image: Int, ms: Int, tries: Int) 
 // The upload of the file `path` as the file `name`.
 @tier(app)
 fn put_file<T: Transport[e]>(wire: T, path: Str, name: Str, ms: Int,
-                        tries: Int) -> Int [io, fs, e, mutate]
+                             tries: Int) -> Int [io, fs, e, mutate]
     match fs.read_bytes(path)
         None    =>
             eprintln("smp-client-nv: cannot read ${path}")
@@ -150,7 +151,8 @@ fn put_file<T: Transport[e]>(wire: T, path: Str, name: Str, ms: Int,
 // The image commands: list, upload, test, confirm, erase.  Answers -2 for
 // words that are none of them.
 @tier(app)
-fn image<T: Transport[e]>(wire: T, w: [Str], index: Int, ms: Int, tries: Int) -> Int [io, fs, e, mutate]
+fn image<T: Transport[e]>(wire: T, w: [Str], index: Int, ms: Int,
+                          tries: Int) -> Int [io, fs, e, mutate]
     if w[1] == "list"
         return smpclient.image_list(wire, ms, tries)
     if w[1] == "erase"
@@ -168,14 +170,14 @@ fn image<T: Transport[e]>(wire: T, w: [Str], index: Int, ms: Int, tries: Int) ->
 
 // Runs the command in `w` over the wire.  Answers the code of the command,
 // -1 when no answer came and -2 when the words are no command.
-@tier(app)
-pub fn command<T: Transport[e]>(wire: T, w: [Str], ms: Int, tries: Int) -> Int [io, fs, e, mutate]
+pub @tier(app)
+fn command<T: Transport[e]>(wire: T, w: [Str], ms: Int, tries: Int) -> Int [io, fs, e, mutate]
     command_for(wire, w, 0, ms, tries)
 
 // `command` with the image an upload goes to: 0 is the firmware, 1 the data region.
-@tier(app)
-pub fn command_for<T: Transport[e]>(wire: T, w: [Str], index: Int, ms: Int,
-                               tries: Int) -> Int [io, fs, e, mutate]
+pub @tier(app)
+fn command_for<T: Transport[e]>(wire: T, w: [Str], index: Int, ms: Int,
+                                tries: Int) -> Int [io, fs, e, mutate]
     if w.len() >= 2 and w[0] == "echo"
         return smpclient.echo(wire, w[1], ms, tries)
     if w.len() == 1 and w[0] == "params"
@@ -197,8 +199,8 @@ pub fn command_for<T: Transport[e]>(wire: T, w: [Str], index: Int, ms: Int,
     0 - 2
 
 // The exit status for the code `rc` of a command.
-@tier(app)
-pub fn status(rc: Int) -> Int [io]
+pub @tier(app)
+fn status(rc: Int) -> Int [io]
     if rc == 0
         return 0
     if rc == 0 - 2
@@ -211,8 +213,8 @@ pub fn status(rc: Int) -> Int [io]
     1
 
 // The program: the arguments, without the program's name, to its exit status.
-@tier(app)
-pub fn run(args: [Str]) -> Int [io, fs, net, mutate]
+pub @tier(app)
+fn run(args: [Str]) -> Int [io, fs, net, mutate]
     let w = words(args)
     if w.len() < 1
         usage()

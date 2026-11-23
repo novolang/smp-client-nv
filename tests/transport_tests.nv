@@ -91,7 +91,7 @@ fn test_the_framing_round_trips_a_packet_and_is_written_in_pieces() [io, fs, mut
     let lines = smptransport.frame(p)
     test.assert(bytes.len(lines) > bytes.len(p))
     match smptransport.spawn_pipe(["cat"])
-        None    => test.assert(false)
+        None      => test.assert(false)
         Some(raw) =>
             let t = Framed { wire: raw.wire }
             test.assert(t.send(p))
@@ -104,7 +104,7 @@ fn test_the_framing_round_trips_a_packet_and_is_written_in_pieces() [io, fs, mut
     let big = bytes.zeros(mcumgr_nv.CONFIG.SMP_BUF_BYTES + 1)
     test.assert_eq(bytes.len(smptransport.frame(big)), 0)
     match smptransport.spawn_pipe(["cat"])
-        None    => test.assert(false)
+        None      => test.assert(false)
         Some(raw) =>
             test.assert(not Framed { wire: raw.wire }.send(big))
             proc.close(raw.wire.pid)

@@ -111,14 +111,17 @@ impl Sink[io] for FdSink
 
 // Writes `data` to `sink` in pieces of at most `size` bytes, each a `put` of its own and none after the first one that fails.  Answers whether
 // every piece was written.  `size` is at least 1.
-@tier(app)
-pub fn write_pieces<S: Sink[e]>(sink: S, data: Bytes, size: Int) -> Bool [e]
+pub @tier(app)
+fn write_pieces<S: Sink[e]>(sink: S, data: Bytes, size: Int) -> Bool [e]
     let n = bytes.len(data)
     var at = 0
     for _p in 0..n / size + 1
         if at >= n
             break
-        let end = if at + size < n then at + size else n
+        let end = if at + size < n
+            at + size
+        else
+            n
         if not sink.put(bytes.slice(data, at, end))
             return false
         at = end
@@ -182,13 +185,14 @@ var in_link         = smpserial.rx_new()
 
 // The console framing of the packet `packet`, or empty when the packet is
 // larger than the buffer of the package's configuration.
-@tier(app)
-pub fn frame(packet: Bytes) -> Bytes [mutate]
+pub @tier(app)
+fn frame(packet: Bytes) -> Bytes [mutate]
     out_pkt.clear()
     for i in 0..bytes.len(packet)
         match out_pkt.push((bytes.byte_at(packet, i) ?? 0) as u8)
             Ok(_)  => ()
-            Err(_) => return bytes.zeros(0)
+            Err(_) =>
+                return bytes.zeros(0)
     wire_out = []
     smpserial.send(Collector { id: 0 }, var out_pkt, out_pkt.len())
     bytes.from_byte_list(wire_out)
@@ -256,23 +260,23 @@ fn plain_path(path: Str) -> Bool
         return false
     for i in 0..str.len(path)
         let c = str.byte_at_or(path, i, 0)
-        let ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9')
+        let ok = c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c >= '0' and c <= '9'
                  or c == '/' or c == '_' or c == '.' or c == '-' or c == ':'
         if not ok
             return false
     true
 
 // Connects to `host:port`.
-@tier(app)
-pub fn connect(host: Str, port: Int, ms: Int) -> ?Framed<TcpWire> [net]
+pub @tier(app)
+fn connect(host: Str, port: Int, ms: Int) -> ?Framed<TcpWire> [net]
     match net.connect_timeout(host, port, ms)
         None    => None
         Some(s) => Some(Framed { wire: TcpWire { sock: s } })
 
 // Opens the descriptor at `path` as it is: a pty already in raw mode, or a
 // file.
-@tier(app)
-pub fn open_dev(path: Str) -> ?Framed<DevWire> [fs]
+pub @tier(app)
+fn open_dev(path: Str) -> ?Framed<DevWire> [fs]
     match fs.open_write(path)
         None     => None
         Some(fd) => Some(Framed { wire: DevWire { fd: fd } })
@@ -280,8 +284,8 @@ pub fn open_dev(path: Str) -> ?Framed<DevWire> [fs]
 // Opens the serial port at `path` at `baud` bits a second, in raw mode with
 // no echo and no flow control, which `stty` sets.  None when the port does
 // not exist, cannot be opened or `stty` refuses it.
-@tier(app)
-pub fn open_serial(path: Str, baud: Int) -> ?Framed<DevWire> [io, fs]
+pub @tier(app)
+fn open_serial(path: Str, baud: Int) -> ?Framed<DevWire> [io, fs]
     if not plain_path(path) or not fs.exists(path)
         return None
     match process.run_ok("stty -F ${path} ${baud} raw -echo -echoe -echok -crtscts clocal cread 2>/dev/null")
@@ -290,8 +294,8 @@ pub fn open_serial(path: Str, baud: Int) -> ?Framed<DevWire> [io, fs]
 
 // Starts the program `argv` and talks to it in raw packets through its
 // standard input and output.
-@tier(app)
-pub fn spawn_pipe(argv: [Str]) -> ?Raw<PipeWire> [io]
+pub @tier(app)
+fn spawn_pipe(argv: [Str]) -> ?Raw<PipeWire> [io]
     match proc.spawn(argv)
         None      => None
         Some(pid) => Some(Raw { wire: PipeWire { pid: pid } })

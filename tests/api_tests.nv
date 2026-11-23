@@ -163,11 +163,11 @@ fn opt() -> CallOptions
 
 // ── What the progress callbacks record ──────────────────────────────────
 
-var seen_steps  = 0
-var seen_done   = 0
-var seen_total  = 0
-var stop_after  = 0
-var drop_at     = 0
+var seen_steps = 0
+var seen_done  = 0
+var seen_total = 0
+var stop_after = 0
+var drop_at    = 0
 
 @value
 struct Count
@@ -309,7 +309,8 @@ fn test_a_code_of_the_server_is_the_error() [mutate]
     test.assert_eq(SmpError { code: E_NO_ANSWER }.message(), "the server gave no answer")
     test.assert_eq(SmpError { code: E_SEND }.message(), "the transport could not send the request")
     test.assert_eq(SmpError { code: E_BAD_ANSWER }.message(), "the server's answer is malformed")
-    test.assert_eq(SmpError { code: E_HASH }.message(), "the server holds no image with the hash of the uploaded file")
+    test.assert_eq(SmpError { code: E_HASH }.message(),
+        "the server holds no image with the hash of the uploaded file")
     test.assert_eq(SmpError { code: E_CANCELLED }.message(), "the transfer was stopped")
 
 @test
@@ -544,7 +545,8 @@ fn test_an_upload_follows_the_offsets_the_server_answers() [mutate]
     cut.answer(off_pkt(40, 0))
     cut.answer(off_pkt(80, 0))
     reset_count(2)
-    test.assert_eq(code_of(smpapi.image_upload_to(cut, 0, img, smpapi.with_chunk(opt(), 40), Count { id: 0 })), E_CANCELLED)
+    test.assert_eq(code_of(smpapi.image_upload_to(cut, 0, img, smpapi.with_chunk(opt(), 40), Count { id: 0 })),
+        E_CANCELLED)
     test.assert_eq(cut.requests(), 2)
     test.assert_eq(seen_done, 80)
 
@@ -552,7 +554,8 @@ fn test_an_upload_follows_the_offsets_the_server_answers() [mutate]
     let last = smpscript.scripted()
     last.answer(off_pkt(100, 0))
     reset_count(1)
-    test.assert_eq(code_of(smpapi.image_upload_to(last, 0, img, smpapi.with_chunk(opt(), 200), Count { id: 0 })), 0)
+    test.assert_eq(code_of(smpapi.image_upload_to(last, 0, img, smpapi.with_chunk(opt(), 200), Count { id: 0 })),
+        0)
 
     test.case("an offset past the end of the file, a refused image, and an empty file")
     let far = smpscript.scripted()
@@ -633,7 +636,8 @@ fn test_the_files_of_the_volume_go_up_and_come_down_by_the_script() [mutate]
     test.assert_eq(code_of(smpapi.fs_upload(dev, "/e", bytes.zeros(0), opt(), Silent { id: 0 })), 0)
     dev.answer(off_pkt(100, 0))
     reset_count(1)
-    test.assert_eq(code_of(smpapi.fs_upload(dev, "/f", file, smpapi.with_chunk(opt(), 100), Count { id: 0 })), E_CANCELLED)
+    test.assert_eq(code_of(smpapi.fs_upload(dev, "/f", file, smpapi.with_chunk(opt(), 100), Count { id: 0 })),
+        E_CANCELLED)
     dev.answer(off_pkt(400, 0))
     test.assert_eq(code_of(smpapi.fs_upload(dev, "/f", file, opt(), Silent { id: 0 })), E_BAD_ANSWER)
     dev.answer(rc_pkt(ENOENT))

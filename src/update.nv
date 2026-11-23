@@ -108,8 +108,8 @@ fn usage() [io]
     usage_to(false)
 
 // Whether `s` is the address of a Bluetooth device: six pairs of hexadecimal digits joined by colons.
-@tier(app)
-pub fn is_address(s: Str) -> Bool
+pub @tier(app)
+fn is_address(s: Str) -> Bool
     if str.len(s) != 17
         return false
     for i in 0..17
@@ -118,7 +118,7 @@ pub fn is_address(s: Str) -> Bool
             if c != ':'
                 return false
         else
-            let hex = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+            let hex = c >= '0' and c <= '9' or c >= 'a' and c <= 'f' or c >= 'A' and c <= 'F'
             if not hex
                 return false
     true
@@ -134,8 +134,8 @@ fn number(s: Str, fallback: Int) -> Int
     str.to_int(s) ?? fallback
 
 // The command line as options.  `ok` is false for a flag that wants a value and has none.
-@tier(app)
-pub fn parse(args: [Str]) -> Opts
+pub @tier(app)
+fn parse(args: [Str]) -> Opts
     var o = Opts { ok: true, target: "", link: "", addr: "", baud: 115200, ms: 10000, tries: 3, wait: 120,
                    test: false, confirm: false, words: [] }
     var i = 0
@@ -143,7 +143,10 @@ pub fn parse(args: [Str]) -> Opts
         if i >= args.len()
             break
         let a = args[i]
-        let next = if i + 1 < args.len() then args[i + 1] else ""
+        let next = if i + 1 < args.len()
+            args[i + 1]
+        else
+            ""
         let has_next = i + 1 < args.len()
         if a == "--serial"
             o.link = "serial"
@@ -194,8 +197,8 @@ pub fn parse(args: [Str]) -> Opts
     o
 
 // The board, from the JSON that `novo bsp flash --json` prints.  `ok` is false for text that is none.
-@tier(app)
-pub fn board_of(text: Str) -> ?Board [io]
+pub @tier(app)
+fn board_of(text: Str) -> ?Board [io]
     match json.parse(text)
         None    => None
         Some(v) =>
@@ -214,11 +217,18 @@ pub fn board_of(text: Str) -> ?Board [io]
                 Some(r) =>
                     match json.get(r, "slot_b")
                         None    => ()
-                        Some(b) => slot_b = json.get_int(b, "bytes") ?? 0
+                        Some(b) =>
+                            slot_b = json.get_int(b, "bytes") ?? 0
                     match json.get(r, "data")
                         None    => ()
-                        Some(d) => data = json.get_int(d, "bytes") ?? 0
-            Some(Board { name: name, vendor: vendor, probes: probes, serial: probe_serial(), slot_b: slot_b, data: data })
+                        Some(d) =>
+                            data = json.get_int(d, "bytes") ?? 0
+            Some(Board { name: name,
+                vendor: vendor,
+                probes: probes,
+                serial: probe_serial(),
+                slot_b: slot_b,
+                data: data })
 
 // The serial number of the probe `NOVO_PROBE` names (`VID:PID:SERIAL`, as `novo flash` reads it), or "".
 @tier(app)
@@ -241,7 +251,7 @@ fn toolchain() -> Str [io]
 fn plain_name(s: Str) -> Bool
     for i in 0..str.len(s)
         let c = str.byte_at_or(s, i, 0)
-        let ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-' or c == '.'
+        let ok = c >= 'a' and c <= 'z' or c >= 'A' and c <= 'Z' or c >= '0' and c <= '9' or c == '_' or c == '-' or c == '.'
         if not ok
             return false
     true
@@ -269,8 +279,8 @@ fn read_trimmed(p: Str) -> Str [fs]
 
 // The serial ports of USB devices that the system lists under `sys` (`/sys/class/tty`), in the order of
 // their names.  A port's description is read from the USB device above its interface.
-@tier(app)
-pub fn ports(sys: Str, dev: Str) -> [Port] [fs]
+pub @tier(app)
+fn ports(sys: Str, dev: Str) -> [Port] [fs]
     var out: [Port] = []
     var names = fs.read_dir(sys)
     names = list.sort(names)
@@ -286,8 +296,8 @@ pub fn ports(sys: Str, dev: Str) -> [Port] [fs]
 // The ports of the board's probe: those with the serial number `NOVO_PROBE` names, else those whose vendor and product ids are
 // one of the board's `[bsp] probe` ids, else those whose vendor id is the board's.  All of them when the board is unknown or none
 // matches.
-@tier(app)
-pub fn ports_of(all: [Port], board: Board) -> [Port]
+pub @tier(app)
+fn ports_of(all: [Port], board: Board) -> [Port]
     var named: [Port] = []
     var exact: [Port] = []
     var ofvendor: [Port] = []
@@ -307,13 +317,13 @@ pub fn ports_of(all: [Port], board: Board) -> [Port]
     all[:]
 
 // One line for a port.
-@tier(app)
-pub fn port_line(p: Port) -> Str
+pub @tier(app)
+fn port_line(p: Port) -> Str
     "${p.path}  ${p.vid}:${p.pid}  ${p.product}  ${p.serial}"
 
 // The lines of a scan, "name address rssi", as the addresses they hold.
-@tier(app)
-pub fn addresses_of(lines: [Str]) -> [Str]
+pub @tier(app)
+fn addresses_of(lines: [Str]) -> [Str]
     var out: [Str] = []
     for l in lines
         for w in str.split(l, " ")
@@ -373,21 +383,21 @@ fn scan_ble() -> [Str] [io, fs]
     addresses_of(lines)
 
 // The hash of the image in `file`, hexadecimal: bytes 0x20 to 0x3F of the NOVB header, in a package as well.
-@tier(app)
-pub fn image_hash(file: Bytes) -> Str
+pub @tier(app)
+fn image_hash(file: Bytes) -> Str
     let img = smppack.unwrap(file)
     bytes.to_hex(bytes.slice(img, 0x20, 0x40))
 
 // The hash of the image in the file `path`, or "" when the file cannot be read.
-@tier(app)
-pub fn file_hash(path: Str) -> Str [fs]
+pub @tier(app)
+fn file_hash(path: Str) -> Str [fs]
     match fs.read_bytes(path)
         None    => ""
         Some(f) => image_hash(f)
 
 // The steps for the words after the options.  Empty when the words are none this program knows.
-@tier(app)
-pub fn steps_of(w: [Str], o: Opts) -> [Step]
+pub @tier(app)
+fn steps_of(w: [Str], o: Opts) -> [Step]
     if w.len() == 0
         return []
     var verb = w[0]
@@ -428,12 +438,13 @@ pub fn steps_of(w: [Str], o: Opts) -> [Step]
 
 // The checks before the link is opened: the file of an upload can be read and, for a named board, an image
 // fits slot B and a data image is the size of the region.  Answers the sentence for a refusal, or "".
-@tier(app)
-pub fn refusal(s: [Step], b: Board) -> Str [fs]
+pub @tier(app)
+fn refusal(s: [Step], b: Board) -> Str [fs]
     for st in s
         if st.words.len() >= 3 and st.words[1] == "upload"
             match fs.read_bytes(st.words[2])
-                None    => return "cannot read ${st.words[2]}"
+                None    =>
+                    return "cannot read ${st.words[2]}"
                 Some(f) =>
                     if b.name != "" and st.image == 0
                         let n = bytes.len(smppack.unwrap(f))
@@ -446,8 +457,8 @@ pub fn refusal(s: [Step], b: Board) -> Str [fs]
     ""
 
 // Runs the steps over the transport until one fails.  Answers the code of the first that does.
-@tier(app)
-pub fn execute<T: Transport[e]>(t: T, s: [Step], ms: Int, tries: Int) -> Int [io, fs, e, mutate]
+pub @tier(app)
+fn execute<T: Transport[e]>(t: T, s: [Step], ms: Int, tries: Int) -> Int [io, fs, e, mutate]
     for st in s
         let rc = smpcli.command_for(t, st.words, st.image, ms, tries)
         if rc != 0
@@ -493,8 +504,8 @@ fn over_link(o: Opts, addr: Str, s: [Step], ms: Int, tries: Int) -> Int [io, fs,
             rc
 
 // The exit status for the code of `over_link`.
-@tier(app)
-pub fn exit_of(rc: Int) -> Int [io]
+pub @tier(app)
+fn exit_of(rc: Int) -> Int [io]
     if rc == UNREACHED
         return 3
     smpcli.status(rc)
@@ -540,10 +551,10 @@ fn choose_link(o: Opts, b: Board, sys: Str, dev: Str) -> Str [io, fs]
 
 // The steps of an upload with --test and --confirm: what goes before the board restarts, whether it
 // restarts, and what is done once it answers again.
-@tier(app)
-pub fn flow(first: [Step], digest: Str, o: Opts) -> [[Step]]
+pub @tier(app)
+fn flow(first: [Step], digest: Str, o: Opts) -> [[Step]]
     var one = first[:]
-    if digest == "" or (not o.test and not o.confirm)
+    if digest == "" or not o.test and not o.confirm
         return [one]
     if o.test
         list.push(one, Step { words: ["image", "test", digest], image: 0 })
@@ -586,8 +597,8 @@ fn scan(o: Opts, b: Board, sys: Str, dev: Str) -> Int [io, fs]
 
 // The program: the arguments, without the program's name, to its exit status.  `sys` is where the
 // system describes its serial ports and `dev` where their device files are.
-@tier(app)
-pub fn run_in(args: [Str], sys: Str, dev: Str) -> Int [io, fs, net, time, mutate]
+pub @tier(app)
+fn run_in(args: [Str], sys: Str, dev: Str) -> Int [io, fs, net, time, mutate]
     if args.len() == 1 and (args[0] == "--version" or args[0] == "version")
         println("novo-update ${VERSION}")
         return 0
@@ -633,6 +644,6 @@ pub fn run_in(args: [Str], sys: Str, dev: Str) -> Int [io, fs, net, time, mutate
             exit_of(over_link(o, addr, parts[1], o.ms, o.tries))
 
 // `run_in` on the system's own description of its serial ports.
-@tier(app)
-pub fn run(args: [Str]) -> Int [io, fs, net, time, mutate]
+pub @tier(app)
+fn run(args: [Str]) -> Int [io, fs, net, time, mutate]
     run_in(args, "/sys/class/tty", "/dev")
