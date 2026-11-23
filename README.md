@@ -53,7 +53,22 @@ The commands need no install: `novo update` is shipped with the toolchain
 `smpapi` has one function for each command.  `options(ms, tries)` says how long
 a command waits for each of its attempts and how many it makes; `with_chunk`
 caps the bytes of a file in one request, and the default is the most the buffer
-and the transport allow.
+and the transport allow.  `with_window` sets how many upload requests may be in
+flight at once: the default is 4 (`DEFAULT_WINDOW`) and 1 sends a request and
+waits for its response, as every other command does.
+
+A window makes the upload go-back-N on the `off` of the responses, which is the
+offset the server expects next.  A response whose `off` is the end of its request
+takes that request and every one before it; a response whose `off` is less says
+the server did not take the request, and the client sends again from that offset
+with half the window.  The first request goes alone (the server answers it late,
+and a server that kept the start of the file answers with the offset to go on from);
+the window grows by one for each window of requests taken in order; a timeout, or
+the code busy while more than one request was in flight, goes back to what was
+acknowledged with a window of one, so a device that takes one request at a time is
+served at that rate.  `Upload.resent` counts the requests sent again.  A transport
+that drops the answers it did not ask for before it sends (the GATT one does) is
+told by `Transport.keep_queued` to keep them for the length of the upload.
 
 | Call | Answers |
 | --- | --- |
@@ -389,9 +404,8 @@ one on PATH, with the socket of the bridge in front of the Controller
 
 - `novo update` does not call `smpflow`: it opens its link again for each step and its suite fixes the steps it prints.  The flow is for a program
   that holds one transport that it can open again.
-- One request is in flight in a process.  The buffer a request is built in and
-  its sequence numbers belong to the package, so two threads must not call it at
-  the same time.
+- Every command but an upload with a window has one request in flight in a process; an upload keeps up to `window` (at most 64).  The buffer a request
+  is built in and its sequence numbers belong to the package, so two threads must not call it at the same time.
 - A request is at most `smp_buf_bytes` of mcumgr-nv's configuration (512 by
   default) and at most the transport's `mtu`; a response may be of any size the
   transport delivers.
@@ -439,6 +453,7 @@ novo test tests/client_tests.nv     # 16: the commands against a server in the s
 novo test tests/gatt_tests.nv       # 18: the transport over a Central against the server in the same process (every command, writes of 20, 185 and 244 bytes, a response cut at every boundary, a lost, a doubled and a late piece, a link dropped in the middle of an upload and resumed)
 novo test tests/flow_tests.nv       # 21: the table of the stages, the record, the clocks, the flow to its end in each mode, cut at every request, reverted, stopped, refused and left with a device that never returns
 novo test tests/proof_tests.nv      #  8: the flow over the GATT transport against the real server (writes of 20, 185 and 244 bytes, a link dropped after each of 60 writes, a late upload cut, a hung image, a device off the air, a lost piece)
+novo test tests/window_tests.nv     # 12: the upload with a window (every window in order, a lost answer, answers out of order, a request that never arrived, a device that takes one request at a time, a link dropped with requests in flight, a cancel, a damaged answer, an offset past the file), the bytes the device holds checked against the image each time
 novo test tests/transport_tests.nv  #  4: a packet across a pipe, the framing and the pieces of a write, the opening of a serial port
 novo test tests/update_tests.nv     # 21: the command line, the board, the listing, the flow of an update
 novo test tests/volume_tests.nv     #  1: a data image into the data region and the files of its volume

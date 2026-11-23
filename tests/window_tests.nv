@@ -1,0 +1,361 @@
+// window_tests: the upload with a window of requests in flight, against the server of mcumgr-nv in the same process.
+//
+//   novo test tests/window_tests.nv
+//
+// `Chaos` wraps the transport of smpdirect.nv and misbehaves where a test says: a request that never reaches the device, an answer that is lost,
+// two answers that arrive in the other order, a device that takes one request at a time (it ignores a request that comes while another waits for its
+// answer, or answers it busy).  Each case runs the upload with a window and checks what the library answers, how many requests it sent again, that
+// the acknowledged offsets only go up and end at the size of the file, and that the bytes the device holds in its second slot are the image: the
+// device checks the hash of what it was given, and the test reads it.
+
+use std.test
+use std.bytes
+use hostimg
+use smpdevice
+use smpdirect
+use smpapi
+use smpbody
+use smpcbor
+use smphdr
+use smprsp
+use smpscript
+use smptransport
+
+let V1 = 0x01000000
+let V2 = 0x02000000
+
+var cb: SmpBuf = Vec.new()
+
+// What the transport does wrong, and what it has seen.  `drop_request` is the number of the request (from 1) that never reaches the device, `drop_answer`
+// the number of the answer that is lost, `swap_answer` the number of the answer that is delivered after the one behind it, `busy` 1 for a device that
+// ignores a request that comes while another waits for its answer and 2 for one that answers it busy.
+struct ChaosState
+    var sent: Int
+    var delivered: Int
+    var pending: Int
+    var drop_request: Int
+    var drop_answer: Int
+    var swap_answer: Int
+    var busy: Int
+    var corrupt_answer: Int
+    var far_answer: Int
+    var ready: [Bytes]
+    var after: [Bytes]
+    var most_in_flight: Int
+
+struct Chaos
+    inner: Direct
+    st: ChaosState
+
+fn chaos() -> Chaos
+    Chaos { inner: smpdirect.direct(),
+        st: ChaosState { sent: 0,
+            delivered: 0,
+            pending: 0,
+            drop_request: 0,
+            drop_answer: 0,
+            swap_answer: 0,
+            busy: 0,
+            corrupt_answer: 0,
+            far_answer: 0,
+            ready: [],
+            after: [],
+            most_in_flight: 0 } }
+
+// A response that says the device is busy, with the number of the request.
+fn busy_answer(seq: Int) -> Bytes [mutate]
+    smprsp.begin(var cb, smphdr.hdr(OP_READ, 0, 0, 1, seq, 1))
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_uint(var cb, "rc", EBUSY)
+    let n = smprsp.finish(var cb)
+    smpscript.packet_of(var cb, n)
+
+// A response that says the server expects the offset `off`, with the number of the request.
+fn off_answer(seq: Int, off: Int) -> Bytes [mutate]
+    smprsp.begin(var cb, smphdr.hdr(OP_READ, 0, 0, 1, seq, 1))
+    smpcbor.put_head(var cb, MAJOR_MAP, 1)
+    smpcbor.put_uint(var cb, "off", off)
+    let n = smprsp.finish(var cb)
+    smpscript.packet_of(var cb, n)
+
+impl Transport[mutate] for Chaos
+    fn send(self, packet: Bytes) -> Bool [mutate]
+        var st = self.st
+        st.sent = st.sent + 1
+        if st.sent == st.drop_request
+            return true
+        if st.busy > 0 and st.pending > 0
+            if st.busy == 2
+                list.push(st.ready, busy_answer(smpbody.seq_of(packet)))
+            return true
+        st.pending = st.pending + 1
+        if st.pending > st.most_in_flight
+            st.most_in_flight = st.pending
+        self.inner.send(packet)
+
+    fn recv(self, ms: Int) -> ?Bytes [mutate]
+        var st = self.st
+        for _i in 0..1000
+            if list.len(st.ready) > 0
+                let p = st.ready[0]
+                st.ready = st.ready[1:list.len(st.ready)]
+                return Some(p)
+            match self.inner.recv(ms)
+                None    =>
+                    if list.len(st.after) > 0
+                        let q = st.after[0]
+                        st.after = st.after[1:list.len(st.after)]
+                        return Some(q)
+                    return None
+                Some(p) =>
+                    st.pending = st.pending - 1
+                    st.delivered = st.delivered + 1
+                    if st.delivered == st.drop_answer
+                        continue
+                    if st.delivered == st.corrupt_answer
+                        // The header is whole and names the request, and the body is cut: the answer is no answer.
+                        return Some(bytes.slice(p, 0, 9))
+                    if st.delivered == st.far_answer
+                        return Some(off_answer(smpbody.seq_of(p), 1000000))
+                    if st.delivered == st.swap_answer
+                        list.push(st.after, bytes.clone(p))
+                        continue
+                    if list.len(st.after) > 0
+                        list.push(st.ready, st.after[0])
+                        st.after = st.after[1:list.len(st.after)]
+                    return Some(p)
+        None
+
+impl Reopen[mutate] for Chaos
+    fn lost(self) -> Bool
+        self.inner.lost()
+
+    fn reopen(self, ms: Int) -> Bool [mutate]
+        self.inner.reopen(ms)
+
+// The offsets a progress callback was told, in order.
+struct Seen
+    var at: [Int]
+
+struct Rec
+    st: Seen
+
+impl Progress[mutate] for Rec
+    fn step(self, done: Int, total: Int) -> Bool [mutate]
+        var s = self.st
+        list.push(s.at, done)
+        true
+
+fn rec() -> Rec
+    Rec { st: Seen { at: [] } }
+
+fn opts(window: Int) -> CallOptions
+    smpapi.with_window(smpapi.with_chunk(smpapi.options(50, 3), 200), window)
+
+fn fresh_device() -> Bytes [mutate]
+    smpdevice.fresh(V1)
+    smpdevice.image_of(V2, 3000, 5)
+
+fn hex_of(img: Bytes) -> Str
+    bytes.to_hex(smpapi.expected_hash(img))
+
+// The acknowledged offsets go up and the last is the whole file.
+fn check_progress(r: Rec, total: Int) [mutate]
+    var last = 0
+    for a in r.st.at
+        test.assert(a > last)
+        last = a
+    test.assert_eq(last, total)
+
+// Uploads `img` over `t` with `window` and checks what a case must keep: it ends well, the device holds the image, the progress is in order.
+// Answers [requests, resumed_at, resent] of the upload.
+fn upload<T: Transport[e]>(t: T, img: Bytes, window: Int) -> [Int] [e, mutate]
+    let r = rec()
+    match smpapi.image_upload_to(t, 0, img, opts(window), r)
+        Ok(u)  =>
+            test.assert_eq(smpdevice.slot_hash(1), hex_of(img))
+            check_progress(r, bytes.len(img))
+            [u.requests, u.resumed_at, u.resent]
+        Err(x) =>
+            test.fail("the upload failed with ${x.code}")
+            [0, 0, 0]
+
+@test
+fn test_answers_in_order_take_every_window_and_send_nothing_twice() [io, fs, net, mutate]
+    for w in [1, 2, 4, 8]
+        let img = fresh_device()
+        var t = chaos()
+        let u = upload(t, img, w)
+        test.assert_eq(u[0], 17)
+        test.assert_eq(u[2], 0)
+        test.assert_eq(u[1], 0)
+        test.assert(t.st.most_in_flight <= w)
+        if w > 1
+            test.assert(t.st.most_in_flight > 1)
+        else
+            test.assert_eq(t.st.most_in_flight, 1)
+
+@test
+fn test_a_window_never_holds_more_than_it_was_given() [io, fs, net, mutate]
+    let img = fresh_device()
+    var t = chaos()
+    let u = upload(t, img, 100)
+    test.assert(t.st.most_in_flight <= 64)
+    test.assert_eq(u[2], 0)
+
+@test
+fn test_a_lost_answer_is_made_good_by_the_next_and_the_last_one_by_a_resend() [io, fs, net, mutate]
+    test.case("an answer is the offset the server expects, so the one behind it acknowledges the lost one too")
+    for k in [2, 5, 9, 16]
+        let img = fresh_device()
+        var t = chaos()
+        t.st.drop_answer = k
+        let u = upload(t, img, 4)
+        test.assert_eq(u[2], 0)
+        test.assert_eq(u[0], 17)
+
+    test.case("the last answer is lost: nothing is left to acknowledge it, and the window goes back")
+    let last = fresh_device()
+    var t = chaos()
+    t.st.drop_answer = 17
+    let u = upload(t, last, 4)
+    test.assert(u[2] >= 1)
+    test.assert(u[0] > 17)
+
+    test.case("the answer to the first request is lost: one request goes again")
+    let img = fresh_device()
+    var t1 = chaos()
+    t1.st.drop_answer = 1
+    let u1 = upload(t1, img, 4)
+    test.assert(u1[2] >= 1)
+
+@test
+fn test_answers_out_of_order_are_taken_without_a_resend() [io, fs, net, mutate]
+    for k in [2, 6, 10]
+        let img = fresh_device()
+        var t = chaos()
+        t.st.swap_answer = k
+        let u = upload(t, img, 4)
+        test.assert_eq(u[2], 0)
+        test.assert_eq(u[0], 17)
+
+@test
+fn test_a_request_that_never_arrived_is_answered_with_an_offset_behind_the_window() [io, fs, net, mutate]
+    for k in [3, 6, 12]
+        let img = fresh_device()
+        var t = chaos()
+        t.st.drop_request = k
+        let u = upload(t, img, 4)
+        test.assert(u[2] > 0)
+        test.assert(u[0] > 17)
+
+@test
+fn test_a_device_that_takes_one_request_at_a_time_is_served_at_that_rate() [io, fs, net, mutate]
+    for mode in [1, 2]
+        for w in [2, 4, 8]
+            let img = fresh_device()
+            var t = chaos()
+            t.st.busy = mode
+            let u = upload(t, img, w)
+            test.assert(u[2] > 0)
+            test.assert(t.st.most_in_flight == 1)
+
+    test.case("a window of one is no different for such a device")
+    let img = fresh_device()
+    var t = chaos()
+    t.st.busy = 1
+    let u = upload(t, img, 1)
+    test.assert_eq(u[2], 0)
+
+@test
+fn test_the_link_dropping_with_requests_in_flight_ends_the_call_and_the_next_one_goes_on() [io, fs, net, mutate]
+    for k in [2, 4, 7, 12]
+        let img = fresh_device()
+        let t = smpdirect.direct()
+        t.cut_after(k)
+        match smpapi.image_upload_to(t, 0, img, opts(4), smpapi.Silent { id: 0 })
+            Ok(_)  => test.fail("the upload ended well on a link that was cut")
+            Err(x) => test.assert_eq(x.code, E_SEND)
+        test.assert(t.lost())
+        test.assert(t.reopen(0))
+        let r = rec()
+        match smpapi.image_upload_to(t, 0, img, opts(4), r)
+            Ok(u)  =>
+                test.assert(u.resumed_at > 200)
+                test.assert_eq(smpdevice.slot_hash(1), hex_of(img))
+                check_progress(r, bytes.len(img))
+            Err(x) => test.fail("the second upload failed with ${x.code}")
+
+@test
+fn test_an_upload_stops_where_the_callback_says_and_goes_on_from_the_device() [io, fs, net, mutate]
+    let img = fresh_device()
+    var t = chaos()
+    match smpapi.image_upload_to(t, 0, img, opts(4), Gate { st: GateState { left: 5 } })
+        Ok(_)  => test.fail("the upload went on")
+        Err(x) => test.assert_eq(x.code, E_CANCELLED)
+    match smpapi.image_upload_to(t, 0, img, opts(4), smpapi.Silent { id: 0 })
+        Ok(u)  =>
+            test.assert(u.resumed_at > 200)
+            test.assert_eq(smpdevice.slot_hash(1), hex_of(img))
+        Err(x) => test.fail("the second upload failed with ${x.code}")
+
+struct GateState
+    var left: Int
+
+struct Gate
+    st: GateState
+
+impl Progress[mutate] for Gate
+    fn step(self, done: Int, total: Int) -> Bool [mutate]
+        var s = self.st
+        s.left = s.left - 1
+        s.left > 0
+
+@test
+fn test_a_device_that_answers_nothing_ends_the_upload_after_its_tries() [io, fs, net, mutate]
+    let img = fresh_device()
+    var t = chaos()
+    t.st.drop_request = 1
+    match smpapi.image_upload_to(t, 0, img, smpapi.with_window(smpapi.with_chunk(smpapi.options(50, 1), 200), 4), smpapi.Silent { id: 0 })
+        Ok(_)  => test.fail("the upload ended well")
+        Err(x) => test.assert_eq(x.code, E_NO_ANSWER)
+
+@test
+fn test_a_code_of_the_device_ends_the_upload_as_it_does_with_one_request() [io, fs, net, mutate]
+    smpdevice.fresh(V1)
+    let other = hostimg.image(0x999, 0x96A06A37, 256, 1, 1, true, smpdevice.payload(3000, 1))
+    for w in [1, 4]
+        match smpapi.image_upload_to(chaos(), 0, other, opts(w), smpapi.Silent { id: 0 })
+            Ok(_)  => test.fail("an image of another board was taken")
+            Err(x) => test.assert(x.code > 0)
+
+@test
+fn test_a_damaged_answer_and_an_offset_past_the_file_end_the_upload() [io, fs, net, mutate]
+    let one_try = smpapi.with_window(smpapi.with_chunk(smpapi.options(50, 1), 200), 4)
+    var t = chaos()
+    t.st.corrupt_answer = 1
+    match smpapi.image_upload_to(t, 0, fresh_device(), one_try, smpapi.Silent { id: 0 })
+        Ok(_)  => test.fail("a damaged answer was taken")
+        Err(x) => test.assert_eq(x.code, E_BAD_ANSWER)
+
+    test.case("a damaged answer among good ones is passed over")
+    var t2 = chaos()
+    t2.st.corrupt_answer = 4
+    let img = fresh_device()
+    let u = upload(t2, img, 4)
+    test.assert(u[0] >= 17)
+
+    test.case("the server expects an offset past the end of the file")
+    var t3 = chaos()
+    t3.st.far_answer = 3
+    match smpapi.image_upload_to(t3, 0, fresh_device(), opts(4), smpapi.Silent { id: 0 })
+        Ok(_)  => test.fail("an offset past the file was taken")
+        Err(x) => test.assert_eq(x.code, E_BAD_ANSWER)
+
+@test
+fn test_a_transport_that_refuses_a_request_ends_the_upload() [io, fs, net, mutate]
+    let t = smpdirect.direct()
+    t.cut_before(3)
+    match smpapi.image_upload_to(t, 0, fresh_device(), opts(4), smpapi.Silent { id: 0 })
+        Ok(_)  => test.fail("the upload ended well")
+        Err(x) => test.assert_eq(x.code, E_SEND)

@@ -89,22 +89,36 @@ fn code_name(code: Int) -> Str
     "code of the server"
 
 // How a command waits and how an upload is cut into requests.  `ms` is the time to wait for a response, `tries` the number of
-// times a request is sent, and `chunk` the most bytes of a file in one request, 0 for the most the buffer and the transport allow.
+// times a request is sent, `chunk` the most bytes of a file in one request, 0 for the most the buffer and the transport allow, and
+// `window` the most upload requests in flight at once: 1 sends a request and waits for its response, as every other command does.
 pub @value
 struct CallOptions
     ms: Int
     tries: Int
     chunk: Int
+    window: Int
 
-// CallOptions that wait `ms` milliseconds for each of `tries` attempts and cut a file as large as the buffer and the transport allow.
+// The window of an upload that the caller sets nothing for.
+pub const DEFAULT_WINDOW = 4
+
+// The most requests a window holds: the sequence number is eight bits, and a request in flight must have a number of its own.
+const MAX_WINDOW = 64
+
+// CallOptions that wait `ms` milliseconds for each of `tries` attempts, cut a file as large as the buffer and the transport allow and keep up to
+// `DEFAULT_WINDOW` upload requests in flight.
 pub @tier(app)
 fn options(ms: Int, tries: Int) -> CallOptions
-    CallOptions { ms: ms, tries: tries, chunk: 0 }
+    CallOptions { ms: ms, tries: tries, chunk: 0, window: DEFAULT_WINDOW }
 
 // `o` with a chunk of at most `chunk` bytes.
 pub @tier(app)
 fn with_chunk(o: CallOptions, chunk: Int) -> CallOptions
-    CallOptions { ms: o.ms, tries: o.tries, chunk: chunk }
+    CallOptions { ms: o.ms, tries: o.tries, chunk: chunk, window: o.window }
+
+// `o` with a window of `window` upload requests, 1 for none.
+pub @tier(app)
+fn with_window(o: CallOptions, window: Int) -> CallOptions
+    CallOptions { ms: o.ms, tries: o.tries, chunk: o.chunk, window: window }
 
 // What a transfer tells its caller as it goes: `step` runs after each response, with the bytes done and the bytes in all (the
 // total of a download is what the server stated, 0 until the first response), and answers whether to go on.  False stops the
@@ -139,12 +153,14 @@ struct Params
     buf_size: Int
     buf_count: Int
 
-// What an upload did: the requests it sent and the offset the server answered to the first, which is above the first chunk when the
-// server held the start of the file already.
+// What an upload did: the requests it sent, the offset the server answered to the first, which is above the first chunk when the
+// server held the start of the file already, and how many of the requests were sent again because an answer said the server had not
+// taken them or none came (always 0 with a window of 1, which sends a request again within its own tries and counts it once).
 pub @value
 struct Upload
     requests: Int
     resumed_at: Int
+    resent: Int
 
 // What `fs_hash` answers: the CRC-32 of the file and the bytes it covers.
 pub @value
@@ -326,9 +342,25 @@ fn expected_hash(file: Bytes) -> Bytes
 // it expects next, and the upload goes on from there; so a first request that is answered with an offset above zero resumes an
 // upload an earlier call left, whatever the call.  `p` is told after each response.  The first request of a NOVB image or a
 // package carries the image's hash.  Nothing is checked after the last request: `image_upload` is the call that does.
+//
+// With `o.window` above 1 the requests go out without waiting for each response, up to the window, and the upload is go-back-N on the
+// `off` of the responses: `off` is the offset the server expects next, so a response whose `off` is the end of its request takes that
+// request and every one before it, and a response whose `off` is less says the server did not take the request and expects that offset, from
+// which the client sends again with half the window.  The first request is sent alone (the server answers it late, and a server that holds
+// the start of the file answers with the offset to go on from), the window grows by one for each window of requests that was taken in order,
+// and a timeout, or the code busy, while more than one request was in flight goes back to what was acknowledged with a window of one: a
+// server that takes one request at a time is served at that rate.  Any other code of the server ends the upload, as it does with a window of 1.
 pub @tier(app)
 fn image_upload_to<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: Bytes, o: CallOptions,
                                                     p: P) -> Result<Upload, SmpError> [e, f, mutate]
+    if o.window > 1
+        return upload_window(t, image, file, o, p)
+    upload_serial(t, image, file, o, p)
+
+// The upload that sends a request and waits for its response.
+@tier(app)
+fn upload_serial<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: Bytes, o: CallOptions,
+                                                  p: P) -> Result<Upload, SmpError> [e, f, mutate]
     let total = bytes.len(file)
     var sha = bytes.zeros(0)
     if image == 0
@@ -354,7 +386,150 @@ fn image_upload_to<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: Byte
             off = at
             if not p.step(off, total) and off < total
                 return Err(fail(E_CANCELLED))
-    Ok(Upload { requests: sent, resumed_at: resumed })
+    Ok(Upload { requests: sent, resumed_at: resumed, resent: 0 })
+
+// The index in the list of the request that has the sequence number `n`, -1 when none has.
+@tier(app)
+fn index_of(xs: [Int], n: Int) -> Int
+    for i in 0..list.len(xs)
+        if xs[i] == n
+            return i
+    0 - 1
+
+// Takes the answers that are already waiting and drops them: the answers of requests that were given up when the upload went back.
+@tier(app)
+fn drain<T: Transport[e]>(t: T) [e, mutate]
+    for _d in 0..MAX_WINDOW
+        match t.recv(0)
+            None    => break
+            Some(_) => ()
+
+// The upload with a window: see `image_upload_to`.
+@tier(app)
+fn upload_window<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: Bytes, o: CallOptions,
+                                                  p: P) -> Result<Upload, SmpError> [e, f, mutate]
+    let total = bytes.len(file)
+    var sha = bytes.zeros(0)
+    if image == 0
+        sha = expected_hash(file)
+    let room = chunk_of(t, o.chunk)
+    var cap = o.window
+    if cap > MAX_WINDOW
+        cap = MAX_WINDOW
+    var win = cap
+    var acked = 0
+    var next = 0
+    var sent = 0
+    var resent = 0
+    var resumed = 0
+    var answered = 0
+    var quiet = 0
+    var clean = 0
+    var damaged = false
+    var seqs: [Int] = []
+    var ends: [Int] = []
+    t.keep_queued(true)
+    for _r in 0..4 * total + 1000
+        if acked >= total
+            break
+        // Fills the window; the first request goes alone.
+        var limit = win
+        if answered == 0
+            limit = 1
+        for _f in 0..MAX_WINDOW
+            if list.len(seqs) >= limit or next >= total
+                break
+            var n = total - next
+            if n > room
+                n = room
+            let s = next_seq()
+            let len = smpreq.image_upload_to(var req, s, 0, image, file, next, n, sha, false)
+            if not t.send(packet_of_req(len))
+                t.keep_queued(false)
+                return Err(fail(E_SEND))
+            list.push(seqs, s)
+            list.push(ends, next + n)
+            next = next + n
+            sent = sent + 1
+        match t.recv(o.ms)
+            None    =>
+                // Nothing came: go back to what is acknowledged, one request at a time.
+                quiet = quiet + 1
+                if quiet >= o.tries
+                    t.keep_queued(false)
+                    if damaged
+                        return Err(fail(E_BAD_ANSWER))
+                    return Err(fail(E_NO_ANSWER))
+                resent = resent + list.len(seqs)
+                seqs = []
+                ends = []
+                next = acked
+                win = 1
+                clean = 0
+                drain(t)
+            Some(pk) =>
+                let i = index_of(seqs, smpbody.seq_of(pk))
+                if i < 0
+                    continue
+                if not smpbody.valid(pk)
+                    damaged = true
+                    continue
+                let rc = smpbody.rc_of(pk)
+                if rc != 0
+                    if rc != EBUSY or list.len(seqs) < 2
+                        t.keep_queued(false)
+                        return Err(fail(rc))
+                    // Busy while several requests were in flight: a server that takes one at a time.  Go back and ask one by one.
+                    resent = resent + list.len(seqs)
+                    seqs = []
+                    ends = []
+                    next = acked
+                    win = 1
+                    clean = 0
+                    drain(t)
+                    continue
+                let end = ends[i]
+                let at = smpbody.uint(pk, "off", end)
+                if at > total
+                    t.keep_queued(false)
+                    return Err(fail(E_BAD_ANSWER))
+                quiet = 0
+                if answered == 0 and at > end
+                    resumed = at
+                answered = answered + 1
+                if at >= end
+                    // Taken: the server expects `at`, so this request and the ones before it are acknowledged.
+                    if at > acked
+                        acked = at
+                    var k = 0
+                    for j in 0..list.len(ends)
+                        if ends[j] <= acked
+                            k = j + 1
+                    seqs = seqs[k:list.len(seqs)]
+                    ends = ends[k:list.len(ends)]
+                    if next < acked
+                        next = acked
+                    clean = clean + 1
+                    if clean >= win and win < cap
+                        win = win + 1
+                        clean = 0
+                    if not p.step(acked, total) and acked < total
+                        t.keep_queued(false)
+                        return Err(fail(E_CANCELLED))
+                else
+                    // Not taken: the server expects `at`.  What was sent beyond it is sent again.
+                    resent = resent + list.len(seqs)
+                    seqs = []
+                    ends = []
+                    acked = at
+                    next = at
+                    win = win / 2
+                    if win < 1
+                        win = 1
+                    clean = 0
+                    drain(t)
+    t.keep_queued(false)
+    Ok(Upload { requests: sent, resumed_at: resumed, resent: resent })
 
 // `image_upload_to` for the firmware, then a check that the server holds the image: its list must have an image whose hash is the
 // one the file carries.  A file with no hash to read (`expected_hash`) is not checked.  `E_HASH` when no listed image has it.

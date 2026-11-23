@@ -367,7 +367,8 @@ fn decide(slots: [Slot], c: Candidate, mode: Mode, reset_sent: Bool) -> Action
 // ── The report ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 // What a run did.  `stage` is the step it ended in; `code` is the code of the command that failed, 0 when none did, and `why` says it in a
-// sentence; `old_version` is the running version when the run began; `requests` counts the upload requests sent and `resumed_at` is the
+// sentence; `old_version` is the running version when the run began; `requests` counts the upload requests sent, `resent` those of them that were sent again
+// because the device had not taken them (a lossy link, or a device that takes one at a time, which a window of more than one shows), and `resumed_at` is the
 // offset a resumed upload went on from, 0 when none was resumed; `reconnects` counts the links made again; `log` holds the lines the
 // journal was given.
 pub struct Report
@@ -378,6 +379,7 @@ pub struct Report
     old_version: Str
     new_version: Str
     requests: Int
+    resent: Int
     resumed_at: Int
     reconnects: Int
     elapsed_ms: Int
@@ -392,6 +394,7 @@ struct Run
     var uploads: Int
     var fails: Int
     var requests: Int
+    var resent: Int
     var resumed_at: Int
     var reconnects: Int
     var old_version: Str
@@ -537,6 +540,7 @@ fn act<T: Transport[e] + Reopen[f], P: Progress[g], J: Journal[h], K: Clock[k]>(
             match smpapi.image_upload_to(t, 0, file, plan.call, p)
                 Ok(u)  =>
                     run.requests = run.requests + u.requests
+                    run.resent = run.resent + u.resent
                     if run.resumed_at == 0
                         run.resumed_at = u.resumed_at
                     run.uploads = run.uploads + 1
@@ -599,6 +603,7 @@ fn run<T: Transport[e] + Reopen[f], P: Progress[g], J: Journal[h], K: Clock[k]>(
                 old_version: "",
                 new_version: "",
                 requests: 0,
+                resent: 0,
                 resumed_at: 0,
                 reconnects: 0,
                 elapsed_ms: 0,
@@ -617,6 +622,7 @@ fn run<T: Transport[e] + Reopen[f], P: Progress[g], J: Journal[h], K: Clock[k]>(
                 uploads: 0,
                 fails: 0,
                 requests: 0,
+                resent: 0,
                 resumed_at: 0,
                 reconnects: 0,
                 old_version: "",
@@ -668,6 +674,7 @@ fn run<T: Transport[e] + Reopen[f], P: Progress[g], J: Journal[h], K: Clock[k]>(
                 old_version: run.old_version,
                 new_version: c.version,
                 requests: run.requests,
+                resent: run.resent,
                 resumed_at: run.resumed_at,
                 reconnects: run.reconnects,
                 elapsed_ms: clk.now_ms() - start,

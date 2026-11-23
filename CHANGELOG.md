@@ -7,6 +7,11 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## Unreleased (0.1.2)
 
+- `CallOptions.window` and `with_window`: an upload keeps up to `window` requests in flight (default 4, 1 is the stop-and-wait of before) and is go-back-N on the `off` of the
+  responses; `Upload.resent` and `Report.resent` count the requests sent again; `Transport.keep_queued` (default: nothing) tells a transport to keep the answers that wait.
+  `CallOptions` gained a field, so a program that builds one by its fields must add `window`; `options` and `with_chunk` do.  The flow's resume logic is unchanged: it reads
+  the list at every step, and the first answer of an upload still says where the server resumes.
+
 - `smpgatt`: the `Transport` over a `GattCentral` of ble-central-nv.  `open` connects a peer, discovers the SMP service, asks for the largest MTU
   and the short connection interval and subscribes; `attach` does the discovery and the subscription on a link the program connected.  `send`
   writes a packet to the characteristic without a response in pieces of the link's largest write and first drops the notifications that wait and

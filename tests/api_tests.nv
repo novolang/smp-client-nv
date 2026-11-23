@@ -158,8 +158,10 @@ fn payload(n: Int, salt: Int) -> Bytes
         list.push(out, (i * 11 + salt) & 0xFF)
     bytes.from_byte_list(out)
 
+// Stop-and-wait: the scripted device stamps each answer with the number of the request sent last, which only one request in flight can use.  The window is
+// tested in window_tests.nv.
 fn opt() -> CallOptions
-    smpapi.options(50, 2)
+    smpapi.with_window(smpapi.options(50, 2), 1)
 
 // ── What the progress callbacks record ──────────────────────────────────
 
@@ -862,7 +864,7 @@ fn test_a_lost_answer_stops_an_upload_with_one_try_and_a_second_call_goes_on() [
     let old = image(0x01000000, 2000, 9)
     let img = image(0x01020003, 3000, 1)
     put_slot(0, old)
-    let chunk = smpapi.with_chunk(smpapi.options(20, 1), 200)
+    let chunk = smpapi.with_window(smpapi.with_chunk(smpapi.options(20, 1), 200), 1)
 
     test.case("the answer to the thirteenth request is lost: with one try the upload fails there")
     reset_count(0)

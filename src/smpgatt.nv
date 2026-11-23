@@ -77,6 +77,8 @@ struct LinkState
     var notifications: Int
     var dropped_bytes: Int
     var opens: Int
+    var pipelined: Bool
+    var pipelined: Bool
 
 // The SMP service of one device, reached through a Central.  `reopen` makes it again after the link ended or the device restarted.
 pub struct GattLink<C: GattCentral[e]>
@@ -168,7 +170,7 @@ pub @tier(app)
 fn open<C: GattCentral[e]>(c: C, peer: PeerId,
                            o: GattOptions) -> Result<GattLink<C>, BleError> [e, mutate, time]
     let st = LinkState { link: LinkId { id: 0 }, chr: CharRef { link: 0, idx: 0 }, rx: [], lost: true, fail_code: 0, fail_text: "", sent: 0,
-                         notifications: 0, dropped_bytes: 0, opens: 0 }
+                         notifications: 0, dropped_bytes: 0, opens: 0, pipelined: false }
     let g = GattLink { central: c, pump: session.pump(), peer: peer, opts: o, st: st }
     match bring_up(g, o.connect_ms)
         Some(x) => Err(x)
@@ -180,7 +182,7 @@ pub @tier(app)
 fn attach<C: GattCentral[e]>(c: C, p: Pump, peer: PeerId, link: LinkId,
                              o: GattOptions) -> Result<GattLink<C>, BleError> [e, mutate, time]
     let st = LinkState { link: link, chr: CharRef { link: 0, idx: 0 }, rx: [], lost: true, fail_code: 0, fail_text: "", sent: 0,
-                         notifications: 0, dropped_bytes: 0, opens: 0 }
+                         notifications: 0, dropped_bytes: 0, opens: 0, pipelined: false }
     let g = GattLink { central: c, pump: p, peer: peer, opts: o, st: st }
     match attach_link(g, link)
         Some(x) => Err(x)
@@ -280,11 +282,13 @@ impl Transport[e, time] for GattLink
         var st = self.st
         if st.lost
             return false
-        st.dropped_bytes = st.dropped_bytes + list.len(st.rx)
-        st.rx = []
-        self.forget_stale()
-        if st.lost
-            return false
+        // A request that goes while others are in flight must leave their answers alone; one that goes alone drops what is left of an earlier one.
+        if not st.pipelined
+            st.dropped_bytes = st.dropped_bytes + list.len(st.rx)
+            st.rx = []
+            self.forget_stale()
+            if st.lost
+                return false
         let data = list_of(packet)
         st.sent = st.sent + 1
         match session.write_all(self.central, self.pump, st.link, st.chr, data, false, self.opts.step_ms)
@@ -292,6 +296,12 @@ impl Transport[e, time] for GattLink
                 self.fail(x.code, x.text)
                 false
             None    => true
+
+    // An upload with a window of requests turns it on: the answers that wait are the answers to requests in flight.
+    @tier(app)
+    fn keep_queued(self, on: Bool) [mutate]
+        var st = self.st
+        st.pipelined = on
 
     @tier(app)
     fn recv(self, ms: Int) -> ?Bytes [e, time, mutate]
