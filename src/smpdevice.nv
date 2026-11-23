@@ -1,0 +1,417 @@
+// smpdevice: a simulated device for the suites of a program that speaks SMP, and a Central that reaches it.
+//
+// The device is the server of mcumgr-nv over RAM slots with novoboot's start-up rule: a request goes to the real session, a reset request
+// swaps the slots as the bootloader does, and an image that runs on trial and is not confirmed before the next start is reverted.  It keeps
+// the slots, counts the starts, and has the faults a suite asks for: the candidate image hangs (the watchdog restarts the device before
+// anything can confirm it), the device ignores a reset request, and the device is off the air for some attempts to reach it after a start.
+//
+// `Periph` is a `GattCentral` that wraps the scripted double of ble-central-nv and answers a write to the SMP characteristic with the
+// notifications of the device's response.  The pieces of a response can be set, lost, doubled and held back, and the link can be cut.
+// `smpdirect.nv` reaches the same device as a `Transport` with no radio model between.
+//
+// The device is module state: one device per process, made by `fresh`.
+
+use std.bytes
+use bootram
+use hostimg
+use smpstate
+use smpsess
+use smpboot
+use smpsim
+use smpram
+use smpfrag
+use smpapi
+use smptransport
+use central
+use scripted
+use smpgatt
+
+let CHIP  = 0x413
+let BOARD = 0x96A06A37
+let HB    = 256
+
+var srv            = smpstate.session()
+var ram            = bootram.ram_slots(256, 64)
+var starts         = 0
+var requests       = 0
+var hang_new       = false
+var ignore_reset   = false
+var off_attempts   = 0
+var reboot_pending = false
+
+// The device with image `version` running in slot A and confirmed, an empty slot B and no fault.
+pub @tier(app)
+fn fresh(version: Int) [mutate]
+    ram = bootram.ram_slots(256, 64)
+    smpboot.set_policy(HB, CHIP, BOARD, 0)
+    srv = smpstate.session()
+    starts = 0
+    requests = 0
+    hang_new = false
+    ignore_reset = false
+    off_attempts = 0
+    reboot_pending = false
+    let _ = smpram.ram_file()
+    let img = image(version, 600, 1)
+    for i in 0..bytes.len(img)
+        bootram.poke(0, i, bytes.byte_at(img, i) ?? 0xFF)
+    // A running image of an earlier boot: confirmed.
+    for i in 0..4
+        bootram.poke(0, 0xF8 + i, (0x464E4F43 >> (8 * i)) & 0xFF)
+
+// The bytes of a payload of `n` bytes seeded by `salt`.
+pub @tier(app)
+fn payload(n: Int, salt: Int) -> Bytes
+    var out: [Int] = []
+    for i in 0..n
+        list.push(out, (i * 11 + salt) & 0xFF)
+    bytes.from_byte_list(out)
+
+// A NOVB image of `n` payload bytes for the device's chip and board, version `version` (major << 24 | minor << 16 | patch).
+pub @tier(app)
+fn image_of(version: Int, n: Int, salt: Int) -> Bytes
+    hostimg.image(CHIP, BOARD, HB, version, salt, true, payload(n, salt))
+
+@tier(app)
+fn image(version: Int, n: Int, salt: Int) -> Bytes
+    image_of(version, n, salt)
+
+// The device hangs the image that runs on trial: the watchdog restarts it at once.
+pub @tier(app)
+fn set_hang(on: Bool) [mutate]
+    hang_new = on
+
+// The device answers a reset request and does not restart.
+pub @tier(app)
+fn set_ignore_reset(on: Bool) [mutate]
+    ignore_reset = on
+
+// After a restart the device is off the air for `n` attempts to reach it.
+pub @tier(app)
+fn set_off(n: Int) [mutate]
+    off_attempts = n
+
+// Whether the device started since the last call: the link to it ended with the start.  Clears the mark.
+pub @tier(app)
+fn take_restart() -> Bool [mutate]
+    let was = reboot_pending
+    reboot_pending = false
+    was
+
+// Whether the device is off the air for this attempt to reach it; each call that answers true uses up one of the attempts `set_off` gave.
+pub @tier(app)
+fn take_off() -> Bool [mutate]
+    if off_attempts > 0
+        off_attempts = off_attempts - 1
+        return true
+    false
+
+// How many times the device started, the first time not counted.
+pub @tier(app)
+fn restarts() -> Int [mutate]
+    starts
+
+// How many requests reached the session.
+pub @tier(app)
+fn handled() -> Int [mutate]
+    requests
+
+// The hash the image in `slot` has, as hexadecimal, "" when the slot holds none.
+pub @tier(app)
+fn slot_hash(slot: Int) -> Str [mutate]
+    var h: [Int] = []
+    for i in 0..32
+        list.push(h, bootram.peek(slot, 0x20 + i))
+    if bootram.peek(slot, 0) != 'N'
+        return ""
+    bytes.to_hex(bytes.from_byte_list(h))
+
+// The hash of the image that runs, hexadecimal.
+pub @tier(app)
+fn running_hash() -> Str [mutate]
+    slot_hash(0)
+
+// Whether the image that runs carries the confirmed word.
+pub @tier(app)
+fn running_confirmed() -> Bool [mutate]
+    var w = 0
+    for i in 0..4
+        w = w | (bootram.peek(0, 0xF8 + i) << (8 * i))
+    w == 0x464E4F43
+
+// The device starts: the rule of the bootloader runs, and a hung image is restarted into its predecessor.
+@tier(app)
+fn restart() [mutate]
+    starts = starts + 1
+    let _ = smpsim.restart(ram)
+    if hang_new and not running_confirmed()
+        starts = starts + 1
+        let _ = smpsim.restart(ram)
+    reboot_pending = true
+
+// Forgets that the last request asked for a reset.
+@tier(app)
+fn clear_reset(var s: Smp)
+    s.reset_after = false
+
+// The response to the request in `srv.rx`, `n` bytes, as a packet; empty when the server gave none.  A reset request restarts the device.
+@tier(app)
+fn answer(n: Int) -> Bytes [mutate]
+    requests = requests + 1
+    let m = smpsess.handle(smpboot.ram_store(ram), smpsim.sim_os(ram), RamFile { id: 0 }, var srv, n)
+    var out: [Int] = []
+    for i in 0..m
+        list.push(out, srv.tx[i] as Int)
+    srv.rx.clear()
+    if srv.reset_after
+        clear_reset(var srv)
+        if not ignore_reset
+            restart()
+    bytes.from_byte_list(out)
+
+// The response of the device to the packet `packet`, empty when the server gave none.
+pub @tier(app)
+fn serve(packet: Bytes) -> Bytes [mutate]
+    srv.rx.clear()
+    var n = 0
+    for i in 0..bytes.len(packet)
+        n = smpfrag.rx_byte(var srv.rx, bytes.byte_at(packet, i) ?? 0)
+    if n <= 0
+        return bytes.zeros(0)
+    answer(n)
+
+// ── Periph ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+// What a `Periph` does to the next response: the sizes of its pieces (empty: the link's), the piece to lose (-1: none), the piece to send
+// twice (-1: none), and whether to hold the response back until the next write.
+struct Faults
+    var split: [Int]
+    var lose: Int
+    var twice: Int
+    var hold: Bool
+    var held: [CentralEvent]
+    var cut_at: Int
+    var writes: Int
+    var inject: [CentralEvent]
+    var inject_at: Int
+
+// A Central with the device behind it.
+pub struct Periph
+    inner: Scripted
+    f: Faults
+
+// The key the device is known by.
+pub @tier(app)
+fn peer_key() -> Str
+    "AA:00:00:00:00:01"
+
+// A Central with the device behind it, the adapter on and no fault set.
+pub @tier(app)
+fn periph() -> Periph [mutate]
+    let s = scripted.scripted()
+    s.add_device(peer_key(), "NovoFOTA")
+    s.add_service(smpgatt.service_uuid(),
+        [scripted.char_spec(smpgatt.char_uuid(), PROP_WRITE_NO_RSP | PROP_NOTIFY, [])])
+    Periph { inner: s, f: Faults { split: [],
+        lose: 0 - 1,
+        twice: 0 - 1,
+        hold: false,
+        held: [],
+        cut_at: 0,
+        writes: 0,
+        inject: [],
+        inject_at: 0 } }
+
+// The peer to connect: the device `periph` made.
+pub @tier(app)
+fn periph_peer() -> PeerId
+    central.peer(peer_key())
+
+impl Periph
+    // The pieces of the next response have these sizes; the last piece takes what is left.
+    @tier(app)
+    fn split_next(self, sizes: [Int]) [mutate]
+        var f = self.f
+        f.split = sizes[:]
+
+    // The `k`th piece of the next response is lost (counted from 0).
+    @tier(app)
+    fn lose_piece(self, k: Int) [mutate]
+        var f = self.f
+        f.lose = k
+
+    // The `k`th piece of the next response arrives twice.
+    @tier(app)
+    fn double_piece(self, k: Int) [mutate]
+        var f = self.f
+        f.twice = k
+
+    // The next response is held back until the next write.
+    @tier(app)
+    fn hold_next(self) [mutate]
+        var f = self.f
+        f.hold = true
+
+    // The events in `events` reach the Central before the `k`th piece of the next response (0: before the first).
+    @tier(app)
+    fn inject_before(self, k: Int, events: [CentralEvent]) [mutate]
+        var f = self.f
+        f.inject_at = k
+        f.inject = events[:]
+
+    // The link drops after the device answered the `k`th write of the link (counted from 1; 0: never).
+    @tier(app)
+    fn cut_at(self, k: Int) [mutate]
+        var f = self.f
+        f.cut_at = k
+
+    // The device's pieces are the scripted double's.
+    @tier(app)
+    fn double(self) -> Scripted
+        self.inner
+
+    // The writes the device took on its link.
+    @tier(app)
+    fn writes(self) -> Int
+        self.f.writes
+
+// The pieces of the packet `p`: the sizes the faults ask for, then `room` each.
+@tier(app)
+fn pieces_of(var f: Faults, p: Bytes, room: Int) -> [[u8]] [mutate]
+    var out: [[u8]] = []
+    var at = 0
+    var k = 0
+    for _i in 0..bytes.len(p) + 1
+        if at >= bytes.len(p)
+            break
+        var n = room
+        if k < list.len(f.split)
+            n = f.split[k]
+        if n > bytes.len(p) - at
+            n = bytes.len(p) - at
+        var piece: [u8] = []
+        for j in 0..n
+            list.push(piece, (bytes.byte_at(p, at + j) ?? 0) as u8)
+        list.push(out, piece)
+        at = at + n
+        k = k + 1
+    f.split = []
+    out
+
+// Queues the notifications of the device's response to the write that just completed.
+@tier(app)
+fn respond(p: Periph, link: LinkId, ch: CharRef, response: Bytes) [mutate]
+    var f = p.f
+    let room = p.inner.max_write(link, false)
+    let pcs = pieces_of(var f, response, room)
+    var events: [CentralEvent] = []
+    for k in 0..list.len(pcs)
+        if k == p.f.inject_at
+            for x in p.f.inject
+                list.push(events, x)
+            f.inject = []
+        if k != f.lose
+            list.push(events, Notified(link, ch, pcs[k]))
+            if k == f.twice
+                list.push(events, Notified(link, ch, pcs[k]))
+    for x in p.f.inject
+        list.push(events, x)
+    f.inject = []
+    f.lose = 0 - 1
+    f.twice = 0 - 1
+    if f.hold
+        f.hold = false
+        f.held = events
+        return
+    for e in events
+        p.inner.push(e)
+
+impl GattCentral[mutate] for Periph
+    @tier(app)
+    fn caps(self) -> Caps
+        self.inner.caps()
+
+    @tier(app)
+    fn adapter(self) -> AdapterState [mutate]
+        self.inner.adapter()
+
+    @tier(app)
+    fn scan_start(self, filter: ScanFilter) -> ?BleError [mutate]
+        self.inner.scan_start(filter)
+
+    @tier(app)
+    fn scan_stop(self) [mutate]
+        self.inner.scan_stop()
+
+    @tier(app)
+    fn connect(self, p: PeerId, opts: ConnectOptions) -> Result<LinkId, BleError> [mutate]
+        if take_off()
+            return Err(central.error(E_TIMEOUT, "the device is off the air"))
+        var f = self.f
+        f.writes = 0
+        f.held = []
+        srv.rx.clear()
+        self.inner.connect(p, opts)
+
+    @tier(app)
+    fn disconnect(self, link: LinkId) [mutate]
+        self.inner.disconnect(link)
+
+    @tier(app)
+    fn discover(self, link: LinkId) -> ?BleError [mutate]
+        self.inner.discover(link)
+
+    @tier(app)
+    fn services(self, link: LinkId) -> [ServiceInfo]
+        self.inner.services(link)
+
+    @tier(app)
+    fn read(self, link: LinkId, ch: CharRef) -> ?BleError [mutate]
+        self.inner.read(link, ch)
+
+    @tier(app)
+    fn write(self, link: LinkId, ch: CharRef, data: [u8], ack: Bool) -> ?BleError [mutate]
+        let refused = self.inner.write(link, ch, data, ack)
+        match refused
+            Some(_) =>
+                return refused
+            None    => ()
+        var f = self.f
+        f.writes = f.writes + 1
+        for e in f.held
+            self.inner.push(e)
+        f.held = []
+        for i in 0..list.len(data)
+            let n = smpfrag.rx_byte(var srv.rx, data[i] as Int)
+            if n > 0
+                let r = answer(n)
+                if bytes.len(r) > 0 and self.inner.sub_of(ch.idx) != 0
+                    respond(self, link, ch, r)
+            if n < 0
+                srv.rx.clear()
+        if take_restart()
+            self.inner.disconnect(link)
+        else if f.writes == f.cut_at
+            f.cut_at = 0
+            self.inner.disconnect(link)
+        None
+
+    @tier(app)
+    fn subscribe(self, link: LinkId, ch: CharRef, mode: SubMode) -> ?BleError [mutate]
+        self.inner.subscribe(link, ch, mode)
+
+    @tier(app)
+    fn request_mtu(self, link: LinkId, mtu: Int) -> ?BleError [mutate]
+        self.inner.request_mtu(link, mtu)
+
+    @tier(app)
+    fn max_write(self, link: LinkId, ack: Bool) -> Int
+        self.inner.max_write(link, ack)
+
+    @tier(app)
+    fn priority(self, link: LinkId, p: Priority) -> ?BleError [mutate]
+        self.inner.priority(link, p)
+
+    @tier(app)
+    fn next_event(self, timeout_ms: Int) -> ?CentralEvent [mutate]
+        self.inner.next_event(timeout_ms)

@@ -9,7 +9,6 @@
 
 use std.test
 use std.bytes
-use std.env
 use std.fs
 use std.net
 use std.process

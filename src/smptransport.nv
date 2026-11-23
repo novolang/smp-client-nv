@@ -48,6 +48,13 @@ pub trait Transport[e]
     fn mtu(self) -> Int
         0
 
+// A transport whose link can end and be made again: a Bluetooth link that dropped, or a device that restarted.  `lost` says the link has ended.
+// `reopen` reaches the same device again, in at most `ms` milliseconds (0: the transport's own limit), and answers whether it did; the
+// transport is the same value afterwards, with a new link in it.  The flow of `smpflow.nv`, which goes on after a restart, calls it.
+pub trait Reopen[e]
+    fn lost(self) -> Bool
+    fn reopen(self, ms: Int) -> Bool [e, mutate]
+
 var tcp_in: [Int] = []
 var tcp_at        = 0
 

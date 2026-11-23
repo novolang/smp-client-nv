@@ -1,0 +1,633 @@
+// gatt_tests: the SMP transport over a Central.
+//
+//   novo test tests/gatt_tests.nv
+//
+// The device behind the Central is the server of mcumgr-nv over RAM slots (smpdevice.nv), reached through the scripted double of
+// ble-central-nv: a write to the SMP characteristic is the bytes of a request, and the notifications that follow are the pieces of its
+// response.  The suite sets the pieces, loses one, doubles one, holds a response back and drops the link, and checks what the commands of
+// smpapi.nv answer over the transport each time.
+
+use std.test
+use std.bytes
+use std.str
+use smpdevice
+use smpgatt
+use smpapi
+use central
+use session
+use scripted
+
+let V1 = 0x01000000
+let V2 = 0x02000000
+
+fn fresh() -> Periph [mutate]
+    smpdevice.fresh(V1)
+    smpdevice.periph()
+
+fn call_opts() -> CallOptions
+    smpapi.options(50, 2)
+
+fn silent() -> Silent
+    Silent { id: 0 }
+
+// The text a command answered, or "-" when it failed.
+fn text(r: Result<Str, SmpError>) -> Str
+    match r
+        Ok(t)  => t
+        Err(_) => "-"
+
+// The number a command answered, or -1 when it failed.
+fn number(r: Result<Int, SmpError>) -> Int
+    match r
+        Ok(n)  => n
+        Err(_) => 0 - 1
+
+// Whether a command that answers nothing succeeded.
+fn done(r: Result<Unit, SmpError>) -> Bool
+    match r
+        Ok(_)  => true
+        Err(_) => false
+
+// Whether an upload succeeded.
+fn uploaded(r: Result<Upload, SmpError>) -> Bool
+    match r
+        Ok(_)  => true
+        Err(_) => false
+
+// Whether a command that answers the image list succeeded.
+fn listed(r: Result<[Slot], SmpError>) -> Bool
+    match r
+        Ok(_)  => true
+        Err(_) => false
+
+// Whether an echo succeeded.
+fn echoed(r: Result<Str, SmpError>) -> Bool
+    match r
+        Ok(_)  => true
+        Err(_) => false
+
+// The sizes of the writes the Central took.
+fn write_sizes(p: Periph) -> [Int] [mutate]
+    var out: [Int] = []
+    for c in p.double().calls()
+        let w = str.split(c, " ")
+        if w[0] == "write"
+            list.push(out, str.to_int(w[2]) ?? 0 - 1)
+    out
+
+@test
+fn test_open_connects_discovers_asks_for_the_mtu_and_subscribes() [io, fs, net, mutate, time]
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            let calls = p.double().calls()
+            test.assert_eq(calls[0], "connect ${smpdevice.peer_key()}")
+            test.assert(list.contains(calls, "discover 1"))
+            test.assert(list.contains(calls, "request_mtu 517"))
+            test.assert(list.contains(calls, "priority"))
+            test.assert_eq(p.double().priority_asked(), 2)
+            test.assert_eq(p.double().sub_of(0), 1)
+            test.assert(not link.lost())
+            test.assert_eq(link.link().id, 1)
+            test.assert_eq(link.stats().opens, 1)
+            test.assert_eq(link.stats().sent, 0)
+            test.assert(link.failure() == None)
+            test.assert(echoed(smpapi.echo(link, "hello", call_opts())))
+            test.assert_eq(link.stats().sent, 1)
+            test.assert_eq(link.stats().notifications, 1)
+
+@test
+fn test_open_fails_with_the_error_of_the_step_that_failed() [io, fs, net, mutate, time]
+    test.case("a device that is not there")
+    var p = fresh()
+    match smpgatt.open(p, central.peer("00:00"), smpgatt.options())
+        Err(e) => test.assert_eq(e.code, E_NOT_FOUND)
+        Ok(_)  => test.fail("opened a device that is not there")
+
+    test.case("a discovery that is refused")
+    p = fresh()
+    p.double().refuse("discover", 9)
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e) => test.assert_eq(e.code, 9)
+        Ok(_)  => test.fail("opened over a refused discovery")
+    test.assert(list.contains(p.double().calls(), "disconnect 1"))
+
+    test.case("a subscription that is refused")
+    p = fresh()
+    p.double().refuse("subscribe", 7)
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e) => test.assert_eq(e.code, 7)
+        Ok(_)  => test.fail("opened over a refused subscription")
+    test.assert(list.contains(p.double().calls(), "disconnect 1"))
+
+    test.case("an MTU request that is refused does not stop the open")
+    p = fresh()
+    p.double().refuse("request_mtu", 3)
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e) => test.fail("open failed: ${e.message()}")
+        Ok(l)  => test.assert(echoed(smpapi.echo(l, "x", call_opts())))
+
+    test.case("an MTU of 23 is not asked for")
+    p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), GattOptions { connect_ms: 1000, step_ms: 1000, want_mtu: 23 })
+        Err(e) => test.fail("open failed: ${e.message()}")
+        Ok(_)  => test.assert(not list.contains(p.double().calls(), "request_mtu 23"))
+
+    test.case("a connection that never completes")
+    p = fresh()
+    p.double().silence("connect")
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e) => test.assert_eq(e.code, E_TIMEOUT)
+        Ok(_)  => test.fail("opened over a connection that never completed")
+
+@test
+fn test_a_device_without_the_service_or_with_another_characteristic_is_refused() [io, fs, net, mutate, time]
+    test.case("no SMP service")
+    let bare = scripted.scripted()
+    bare.add_device("AA:01", "Other")
+    match smpgatt.open(bare, central.peer("AA:01"), smpgatt.options())
+        Err(e) => test.assert_eq(e.code, E_NOT_FOUND)
+        Ok(_)  => test.fail("opened a device with no SMP service")
+
+    test.case("the characteristic cannot notify")
+    let quiet = scripted.scripted()
+    quiet.add_device("AA:02", "Other")
+    quiet.add_service(smpgatt.service_uuid(), [scripted.char_spec(smpgatt.char_uuid(), PROP_WRITE_NO_RSP, [])])
+    match smpgatt.open(quiet, central.peer("AA:02"), smpgatt.options())
+        Err(e) => test.assert_eq(e.code, E_UNSUPPORTED)
+        Ok(_)  => test.fail("opened a characteristic that cannot notify")
+
+    test.case("the characteristic takes no write without a response")
+    let deaf = scripted.scripted()
+    deaf.add_device("AA:03", "Other")
+    deaf.add_service(smpgatt.service_uuid(),
+        [scripted.char_spec(smpgatt.char_uuid(), PROP_WRITE | PROP_NOTIFY, [])])
+    match smpgatt.open(deaf, central.peer("AA:03"), smpgatt.options())
+        Err(e) => test.assert_eq(e.code, E_UNSUPPORTED)
+        Ok(_)  => test.fail("opened a characteristic that takes no write without a response")
+
+@test
+fn test_a_link_the_program_connected_is_attached() [io, fs, net, mutate, time]
+    let p = fresh()
+    let pump = session.pump()
+    match session.open_link(p, pump, smpdevice.periph_peer(), central.connect_default(), 247)
+        Err(e) => test.fail("open_link failed: ${e.message()}")
+        Ok(l)  =>
+            match smpgatt.attach(p, pump, smpdevice.periph_peer(), l, smpgatt.options())
+                Err(e)   => test.fail("attach failed: ${e.message()}")
+                Ok(link) =>
+                    test.assert(echoed(smpapi.echo(link, "attached", call_opts())))
+                    test.assert_eq(link.stats().opens, 1)
+                    test.assert(link.reopen(0))
+                    test.assert_eq(link.stats().opens, 2)
+                    test.assert(list.contains(p.double().calls(), "disconnect 1"))
+
+    test.case("a link whose service is not there")
+    let bare = scripted.scripted()
+    bare.add_device("AA:01", "Other")
+    let bp = session.pump()
+    match session.open_link(bare, bp, central.peer("AA:01"), central.connect_default(), 247)
+        Err(e) => test.fail("open_link failed: ${e.message()}")
+        Ok(l)  =>
+            match smpgatt.attach(bare, bp, central.peer("AA:01"), l, smpgatt.options())
+                Err(e) => test.assert_eq(e.code, E_NOT_FOUND)
+                Ok(_)  => test.fail("attached a link with no SMP service")
+
+@test
+fn test_every_command_of_the_client_runs_over_the_transport() [io, fs, net, mutate, time]
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            let o = smpapi.options(100, 2)
+            test.case("echo and params")
+            test.assert_eq(text(smpapi.echo(link, "over the air", o)), "over the air")
+            match smpapi.params(link, o)
+                Ok(x)  => test.assert(x.buf_size > 0)
+                Err(e) => test.fail(e.message())
+
+            test.case("the image list of a device that runs one image")
+            match smpapi.image_list(link, o)
+                Ok(s)  =>
+                    test.assert_eq(list.len(s), 1)
+                    test.assert(s[0].active)
+                    test.assert(s[0].confirmed)
+                    test.assert_eq(s[0].version, "1.0.0")
+                Err(e) => test.fail(e.message())
+
+            test.case("an upload of 1,500 bytes, with its check")
+            let img = smpdevice.image_of(V2, 1500, 7)
+            match smpapi.image_upload(link, img, o, silent())
+                Ok(u)  => test.assert(u.requests >= 4)
+                Err(e) => test.fail(e.message())
+            test.assert_eq(smpdevice.slot_hash(1), bytes.to_hex(smpapi.expected_hash(img)))
+
+            test.case("test, confirm of the staged image, and erase refused while it is marked")
+            let want = smpapi.expected_hash(img)
+            match smpapi.image_test(link, want, o)
+                Ok(s)  =>
+                    test.assert_eq(list.len(s), 2)
+                    test.assert(s[1].pending)
+                Err(e) => test.fail(e.message())
+            match smpapi.image_erase(link, o)
+                Ok(_)  => test.fail("erased a marked image")
+                Err(e) => test.assert_eq(e.code, 6)
+            match smpapi.image_confirm(link, want, o)
+                Ok(s)  => test.assert(s[1].permanent)
+                Err(e) => test.fail(e.message())
+
+            test.case("the data image is not offered by this device")
+            match smpapi.image_upload_to(link, 1, smpdevice.payload(40, 1), o, silent())
+                Ok(_)  => test.fail("the device took a data image")
+                Err(e) => test.assert_eq(e.code, 8)
+
+            test.case("the file group")
+            let data = smpdevice.payload(300, 5)
+            test.assert(done(smpapi.fs_upload(link, "/note.bin", data, o, silent())))
+            test.assert_eq(number(smpapi.fs_status(link, "/note.bin", o)), 300)
+            match smpapi.fs_hash(link, "/note.bin", o)
+                Ok(h)  => test.assert_eq(h.len, 300)
+                Err(e) => test.fail(e.message())
+            match smpapi.fs_download(link, "/note.bin", o, silent())
+                Ok(b)  => test.assert(bytes.to_hex(b) == bytes.to_hex(data))
+                Err(e) => test.fail(e.message())
+            test.assert(done(smpapi.fs_close(link, o)))
+
+            test.case("a reset restarts the device and ends the link")
+            test.assert(done(smpapi.reset(link, o)))
+            test.assert_eq(smpdevice.restarts(), 1)
+            test.assert(not echoed(smpapi.echo(link, "gone", o)))
+            test.assert(link.lost())
+
+@test
+fn test_a_packet_is_written_in_pieces_of_the_largest_write() [io, fs, net, mutate, time]
+    for mtu in [23, 188, 247]
+        let room = mtu - 3
+        let p = fresh()
+        p.double().set_mtu_limit(mtu)
+        match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+            Err(e)   => test.fail("open failed: ${e.message()}")
+            Ok(link) =>
+                test.assert_eq(p.max_write(link.link(), false), room)
+                let img = smpdevice.image_of(V2, 1500, 3)
+                match smpapi.image_upload(link, img, smpapi.options(100, 2), silent())
+                    Ok(_)  => ()
+                    Err(e) => test.fail("upload over ${room}: ${e.message()}")
+                test.assert_eq(smpdevice.slot_hash(1), bytes.to_hex(smpapi.expected_hash(img)))
+                let sizes = write_sizes(p)
+                var longest = 0
+                var total = 0
+                for s in sizes
+                    test.assert(s >= 1 and s <= room)
+                    total = total + s
+                    if s > longest
+                        longest = s
+                test.assert_eq(longest, room)
+                test.assert(list.len(sizes) > 5)
+                test.assert(total > 1500)
+
+    test.case("a packet that is exactly one piece is written once")
+    let p = fresh()
+    p.double().set_mtu_limit(23)
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            test.assert_eq(text(smpapi.echo(link, "", call_opts())), "")
+            test.assert_eq(list.len(write_sizes(p)), 1)
+
+@test
+fn test_a_response_split_at_every_boundary_is_joined() [io, fs, net, mutate, time]
+    // The response to an echo of "hi" is the 8-byte header and the map {"r": "hi"}, 14 bytes.
+    for k in 1..16
+        let p = fresh()
+        match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+            Err(e)   => test.fail("open failed: ${e.message()}")
+            Ok(link) =>
+                p.split_next([k])
+                test.assert_eq(text(smpapi.echo(link, "hi", call_opts())), "hi")
+                test.assert_eq(smpdevice.handled(), 1)
+                test.assert_eq(link.stats().notifications, (if k < 14 then 2 else 1))
+                test.assert_eq(link.stats().dropped_bytes, 0)
+
+    test.case("three pieces, with the header cut in two places")
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            p.split_next([3, 4])
+            test.assert_eq(text(smpapi.echo(link, "hi", call_opts())), "hi")
+            test.assert_eq(link.stats().notifications, 3)
+
+    test.case("one byte at a time")
+    let q = fresh()
+    match smpgatt.open(q, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            q.split_next([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])
+            test.assert_eq(text(smpapi.echo(link, "hi", call_opts())), "hi")
+            test.assert_eq(link.stats().notifications, 14)
+            test.assert_eq(smpdevice.handled(), 1)
+
+@test
+fn test_a_notification_that_is_lost_costs_one_request() [io, fs, net, mutate, time]
+    for k in 0..2
+        let p = fresh()
+        match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+            Err(e)   => test.fail("open failed: ${e.message()}")
+            Ok(link) =>
+                p.split_next([5])
+                p.lose_piece(k)
+                test.assert_eq(text(smpapi.echo(link, "hi", smpapi.options(50, 2))), "hi")
+                test.assert_eq(smpdevice.handled(), 2)
+                test.assert(link.stats().dropped_bytes > 0)
+
+    test.case("with one try the loss is the answer")
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            p.lose_piece(0)
+            match smpapi.echo(link, "hi", smpapi.options(50, 1))
+                Ok(_)  => test.fail("answered with no response")
+                Err(e) => test.assert_eq(e.code, E_NO_ANSWER)
+            test.assert(not link.lost())
+
+@test
+fn test_a_notification_that_arrives_twice_is_passed_over() [io, fs, net, mutate, time]
+    test.case("the first piece of a response in two pieces is doubled")
+    var p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            p.split_next([5])
+            p.double_piece(0)
+            test.assert_eq(text(smpapi.echo(link, "hi", smpapi.options(50, 2))), "hi")
+            test.assert_eq(smpdevice.handled(), 2)
+
+    test.case("a whole response is doubled and the copy is dropped before the next request")
+    p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            p.double_piece(0)
+            test.assert_eq(text(smpapi.echo(link, "one", call_opts())), "one")
+            test.assert_eq(text(smpapi.echo(link, "two", call_opts())), "two")
+            test.assert_eq(smpdevice.handled(), 2)
+            test.assert_eq(link.stats().notifications, 2)
+
+@test
+fn test_a_response_that_is_late_is_taken_when_the_request_is_sent_again() [io, fs, net, mutate, time]
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            p.hold_next()
+            test.assert_eq(text(smpapi.echo(link, "late", smpapi.options(50, 2))), "late")
+            test.assert_eq(smpdevice.handled(), 2)
+            test.assert_eq(text(smpapi.echo(link, "next", call_opts())), "next")
+
+@test
+fn test_bytes_that_cannot_start_a_response_are_dropped_and_an_overflow_clears_the_packet() [io, fs, net, mutate, time]
+    test.case("a stray tail before the response")
+    var p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            let ch = CharRef { link: 1, idx: 0 }
+            p.inject_before(0, [Notified(link.link(), ch, [255, 255, 255])])
+            test.assert_eq(text(smpapi.echo(link, "hi", call_opts())), "hi")
+            test.assert_eq(link.stats().dropped_bytes, 3)
+            test.assert_eq(smpdevice.handled(), 1)
+
+    test.case("a stray tail longer than a header")
+    p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            let ch = CharRef { link: 1, idx: 0 }
+            p.inject_before(0, [Notified(link.link(), ch, [250, 250, 250, 250, 250, 250, 250, 250, 250, 250])])
+            test.assert_eq(text(smpapi.echo(link, "hi", call_opts())), "hi")
+            test.assert_eq(link.stats().dropped_bytes, 10)
+
+    test.case("an overflow of the stream in the middle of a response")
+    p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            p.split_next([5])
+            p.inject_before(1, [Dropped(2)])
+            test.assert_eq(text(smpapi.echo(link, "hi", smpapi.options(50, 2))), "hi")
+            test.assert_eq(smpdevice.handled(), 2)
+            test.assert(link.stats().dropped_bytes >= 5)
+
+@test
+fn test_a_link_that_drops_in_the_middle_of_an_upload_is_made_again_and_the_upload_resumes() [io, fs, net, mutate, time]
+    let p = fresh()
+    p.double().set_mtu_limit(23)
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            let img = smpdevice.image_of(V2, 4000, 9)
+            let o = smpapi.options(100, 2)
+            p.cut_at(200)
+            match smpapi.image_upload_to(link, 0, img, o, silent())
+                Ok(_)  => test.fail("the upload finished over a dropped link")
+                Err(e) => test.assert_eq(e.code, E_SEND)
+            test.assert(link.lost())
+            match link.failure()
+                Some(x) => test.assert_eq(x.code, E_NOT_CONNECTED)
+                None    => test.fail("a lost link has no failure")
+
+            test.case("the same value goes on over a new link and the device's offset is the resume point")
+            test.assert(link.reopen(0))
+            test.assert(not link.lost())
+            test.assert_eq(link.stats().opens, 2)
+            test.assert(link.failure() == None)
+            match smpapi.image_upload(link, img, o, silent())
+                Ok(u)  =>
+                    test.assert(u.resumed_at > 832)
+                    test.assert(u.requests <= 5)
+                Err(e) => test.fail(e.message())
+            test.assert_eq(smpdevice.slot_hash(1), bytes.to_hex(smpapi.expected_hash(img)))
+
+@test
+fn test_a_link_that_drops_before_the_answer_is_lost_and_the_request_is_not_sent_again() [io, fs, net, mutate, time]
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            p.lose_piece(0)
+            p.cut_at(1)
+            match smpapi.echo(link, "hi", smpapi.options(50, 3))
+                Ok(_)  => test.fail("answered over a dropped link")
+                Err(e) => test.assert_eq(e.code, E_SEND)
+            test.assert(link.lost())
+            test.assert_eq(smpdevice.handled(), 1)
+
+    test.case("a link that ended while a request was written in pieces")
+    let q = fresh()
+    match smpgatt.open(q, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            q.cut_at(1)
+            let img = smpdevice.image_of(V2, 1500, 9)
+            match smpapi.image_upload_to(link, 0, img, smpapi.options(50, 1), silent())
+                Ok(_)  => test.fail("the upload finished over a dropped link")
+                Err(e) => test.assert_eq(e.code, E_SEND)
+            test.assert(link.lost())
+
+@test
+fn test_reopen_waits_for_a_device_that_is_off_the_air_and_close_ends_the_link() [io, fs, net, mutate, time]
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            test.assert(done(smpapi.reset(link, call_opts())))
+            smpdevice.set_off(2)
+            test.assert(not link.reopen(0))
+            test.assert(link.lost())
+            match link.failure()
+                Some(x) => test.assert_eq(x.code, E_TIMEOUT)
+                None    => test.fail("a refused reopen has no failure")
+            test.assert(not link.reopen(1000))
+            test.assert(link.reopen(1000))
+            test.assert_eq(text(smpapi.echo(link, "back", call_opts())), "back")
+            test.assert_eq(link.stats().opens, 2)
+
+            test.case("close ends the link once and a lost link sends nothing")
+            link.close()
+            test.assert(link.lost())
+            link.close()
+            test.assert(not echoed(smpapi.echo(link, "closed", call_opts())))
+
+    test.case("a reopen of a link that did not end disconnects it first")
+    let q = fresh()
+    match smpgatt.open(q, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            test.assert(link.reopen(5))
+            test.assert(list.contains(q.double().calls(), "disconnect 1"))
+            test.assert_eq(link.link().id, 2)
+
+@test
+fn test_the_transport_reports_no_limit_of_its_own() [io, fs, net, mutate, time]
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) => test.assert_eq(link.mtu(), 0)
+
+    test.case("the UUIDs of the service")
+    test.assert_eq(central.uuid_text(smpgatt.service_uuid()), "8d53dc1d-1db7-4cd3-868b-8a527460aa84")
+    test.assert_eq(central.uuid_text(smpgatt.char_uuid()), "da2e7828-fbce-4e01-ae9e-261174997c48")
+
+@test
+fn test_a_receive_with_no_time_left_and_a_receive_on_a_lost_link_answer_none() [io, fs, net, mutate, time]
+    let p = fresh()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            match link.recv(0)
+                Some(_) => test.fail("a packet from nowhere")
+                None    => ()
+            link.close()
+            match link.recv(100)
+                Some(_) => test.fail("a packet over a closed link")
+                None    => ()
+
+    test.case("bytes after a whole response are dropped before the next request")
+    let q = fresh()
+    match smpgatt.open(q, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            let ch = CharRef { link: 1, idx: 0 }
+            q.inject_before(5, [Notified(link.link(), ch, [250, 250])])
+            test.assert_eq(text(smpapi.echo(link, "one", call_opts())), "one")
+            test.assert_eq(text(smpapi.echo(link, "two", call_opts())), "two")
+            test.assert_eq(smpdevice.handled(), 2)
+
+@test
+fn test_the_central_passes_on_what_the_device_does_not_model() [io, fs, net, mutate, time]
+    let p = fresh()
+    test.assert_eq(p.caps().max_mtu, 247)
+    test.assert(p.adapter() == AdapterState.On)
+    test.assert(p.scan_start(central.scan_all()) == None)
+    p.scan_stop()
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            test.assert(p.read(link.link(), CharRef { link: 1, idx: 0 }) == None)
+            test.assert_eq(p.writes(), 0)
+
+            test.case("eight bytes that are no header are dropped by the device")
+            test.assert(p.write(link.link(),
+                CharRef { link: 1, idx: 0 },
+                [255, 255, 255, 255, 255, 255, 255, 255],
+                false) == None)
+            test.assert_eq(smpdevice.handled(), 0)
+            test.assert_eq(text(smpapi.echo(link, "after", call_opts())), "after")
+
+@test
+fn test_the_device_swaps_on_a_reset_and_reverts_an_image_that_hangs() [io, fs, net, mutate, time]
+    var p = fresh()
+    let old = smpdevice.running_hash()
+    test.assert(old != "")
+    test.assert(smpdevice.running_confirmed())
+
+    test.case("an image on trial runs unconfirmed after the restart and a confirm makes it permanent")
+    var img = smpdevice.image_of(V2, 600, 11)
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            let o = smpapi.options(100, 2)
+            test.assert(uploaded(smpapi.image_upload(link, img, o, silent())))
+            match smpapi.image_test(link, smpapi.expected_hash(img), o)
+                Ok(_)  => ()
+                Err(e) => test.fail(e.message())
+            test.assert(done(smpapi.reset(link, o)))
+            test.assert(link.reopen(0))
+            test.assert_eq(smpdevice.running_hash(), bytes.to_hex(smpapi.expected_hash(img)))
+            test.assert(not smpdevice.running_confirmed())
+            test.assert(listed(smpapi.image_confirm(link, bytes.zeros(0), o)))
+            test.assert(smpdevice.running_confirmed())
+            test.assert_eq(smpdevice.restarts(), 1)
+
+    test.case("an image that hangs is reverted by the next start")
+    p = fresh()
+    smpdevice.set_hang(true)
+    img = smpdevice.image_of(V2, 600, 12)
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            let o = smpapi.options(100, 2)
+            test.assert(uploaded(smpapi.image_upload(link, img, o, silent())))
+            match smpapi.image_test(link, smpapi.expected_hash(img), o)
+                Ok(_)  => ()
+                Err(e) => test.fail(e.message())
+            test.assert(done(smpapi.reset(link, o)))
+            test.assert(link.reopen(0))
+            test.assert_eq(smpdevice.running_hash(), old)
+            test.assert_eq(smpdevice.restarts(), 2)
+
+    test.case("a device that ignores a reset request keeps the link and its image")
+    p = fresh()
+    smpdevice.set_ignore_reset(true)
+    match smpgatt.open(p, smpdevice.periph_peer(), smpgatt.options())
+        Err(e)   => test.fail("open failed: ${e.message()}")
+        Ok(link) =>
+            test.assert(done(smpapi.reset(link, smpapi.options(100, 2))))
+            test.assert(not link.lost())
+            test.assert_eq(smpdevice.restarts(), 0)
+
+    test.case("a packet handed to the server directly is answered, and a fragment is not")
+    smpdevice.fresh(V1)
+    test.assert_eq(smpdevice.slot_hash(1), "")
+    test.assert_eq(bytes.len(smpdevice.serve(bytes.zeros(3))), 0)
+    let echo = bytes.from_byte_list([2, 0, 0, 6, 0, 0, 1, 0, 0xA1, 0x61, 0x64, 0x62, 0x68, 0x69])
+    test.assert_eq(bytes.len(smpdevice.serve(echo)), 14)
+
+    test.case("the marks of a restart and of an absent device are taken once")
+    test.assert(not smpdevice.take_restart())
+    smpdevice.set_off(1)
+    test.assert(smpdevice.take_off())
+    test.assert(not smpdevice.take_off())

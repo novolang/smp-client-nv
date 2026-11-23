@@ -15,7 +15,8 @@ update a board and write its data region.
 
 The same calls serve a tool on a PC, a program on a board that is a Bluetooth
 Central and an application on a phone: each hands the library the `Transport`
-that reaches its device, and nothing else in the program changes.
+that reaches its device, and nothing else in the program changes.  Over Bluetooth
+the transport is `smpgatt`, written over the `GattCentral` trait of ble-central-nv.
 
 ## What it is
 
@@ -195,23 +196,49 @@ from a buffer filled with the response builders of mcumgr-nv.
 
 ### Bluetooth Low Energy
 
-The package has no Bluetooth and no dependency on a radio.  A program that owns
-a Bluetooth Host implements `Transport` over the Host's client of the SMP
-service, in about twenty lines; the package noble-examples holds that adapter
-for the noble Host, the module `smp_gatt_transport` (`GattLink`), and its program
-`ble_smp` runs `image list` over the air with it:
+The package has no radio of its own.  `smpgatt` carries SMP over a `GattCentral`, the trait of
+[ble-central-nv](https://novo-lang.org/packages/ble-central-nv) that stands for the GATT operations of a Central: the noble Host on a PC, the
+Bluetooth API of a phone, or the double of a test.  The dependency is on the trait package, which holds no stack.
 
 ```novo ignore
-let opened = smp_gatt_client.open(var ble, conn)
-let t = smp_gatt_transport.link(ble, opened.peer)
-let rc = smpclient.image_list(t, 10000, 1)
+match smpgatt.open(central, peer, smpgatt.options())
+    Err(e)   => println(e.message())
+    Ok(link) =>
+        match smpapi.image_list(link, smpapi.options(10000, 3))
+            Ok(slots) => println("${slots.len()} images")
+            Err(e)    => println(e.message())
 ```
 
-`send` writes the packet to the service's characteristic in pieces of
-`ATT_MTU - 3` bytes, and `recv` joins the notifications of the answer by the
-length in the header.  An application on a phone writes the same two methods
-over the phone's GATT client.  The dependency runs from the adapter to both
-sides: smp-client-nv knows no radio, and the Bluetooth packages know no client.
+`open` connects the peer, discovers the SMP service (`8D53DC1D-1DB7-4CD3-868B-8A527460AA84`), asks for an MTU of 517 and for the short
+connection interval, and subscribes to the characteristic (`DA2E7828-FBCE-4E01-AE9E-261174997C48`: Write Without Response and Notify);
+`attach` does the last two steps on a link the program connected itself.  `GattLink` is the `Transport`:
+
+- `send` writes the packet to the characteristic without a response in pieces of the link's largest write (`max_write`), each waited for, after it
+  has dropped what an earlier request left behind: the notifications that are waiting and the pieces of a packet that never ended.
+- `recv` joins the notifications of one response by the length in the header of the first, whatever the pieces are: a header cut across pieces,
+  a piece that ends one packet and starts the next.  It answers `None` when no piece arrives within the time, or the link has ended, and drops
+  the pieces it held.  Bytes at the front that cannot be the header of a response (reserved bits set, a version the protocol does not define, an
+  operation that is a request) are dropped one at a time, so a stray tail of an earlier response does not hold up the next.
+- A piece that was lost, one that arrived twice and a response that came late cost one request: the packet that results is passed over by
+  `smpapi`, which sends the request again.  The package cannot tell a duplicated piece from a continuation, so the repair is the retry, not the
+  reassembly.
+
+A link that ended is `lost()`, and `failure()` says why.  `smpapi` answers `E_SEND` or `E_NO_ANSWER` for a lost link, as it does for a device
+that does not answer; a caller that must tell them apart asks the link.  `reopen(ms)` connects the same peer again on a new link of the same
+value, which is the `Reopen` trait of `smptransport` that `smpflow` calls.  An upload that was cut resumes from the offset the device kept:
+
+```novo ignore
+if link.lost()
+    if link.reopen(10000)
+        let again = smpapi.image_upload(link, image, smpapi.options(10000, 3), smpapi.Silent { id: 0 })
+```
+
+The PC's adapter over the noble Host, `smp_gatt_transport` in noble-examples, and the one over a phone's Bluetooth API are the two
+implementations of `GattCentral` that this module runs on; neither is in this package.
+
+`smpdevice` is the device of a suite: the server of mcumgr-nv over RAM slots with novoboot's start-up rule (a reset swaps the slots, a trial image
+that is not confirmed is reverted), reached as a `GattCentral` over the double of ble-central-nv (`periph()`), whose next response a test splits,
+loses, doubles or holds back and whose link a test cuts.  A program that speaks SMP tests its flow against it with no radio and no board.
 
 ## What the package contains
 
@@ -219,8 +246,10 @@ sides: smp-client-nv knows no radio, and the Bluetooth packages know no client.
 | --- | --- |
 | `smpapi` | The commands as functions that return values: `CallOptions`, `Progress`, `Slot`, `SmpError` and the calls above. |
 | `smpbody` | A response read as bytes: the check that a packet is whole (`valid`) and the readers of its keys, of any size and with arrays and nested maps. |
-| `smptransport` | The `Wire` trait (a byte at a time), the `Transport` trait (a packet at a time), `Framed` and `Raw` over a wire, `TcpWire`, `DevWire` and `PipeWire`, and `connect`, `open_dev`, `open_serial` and `spawn_pipe`. |
+| `smptransport` | The `Wire` trait (a byte at a time), the `Transport` trait (a packet at a time), the `Reopen` trait, `Framed` and `Raw` over a wire, `TcpWire`, `DevWire` and `PipeWire`, and `connect`, `open_dev`, `open_serial` and `spawn_pipe`. |
 | `smpscript` | `Scripted`, the transport of a test. |
+| `smpgatt` | `GattLink`, the `Transport` over a `GattCentral`: `open`, `attach`, `reopen`, the UUIDs of the SMP service. |
+| `smpdevice` | A device for a suite: the server of mcumgr-nv over RAM slots with novoboot's start-up rule, as a `GattCentral` (`periph`). |
 | `smpclient` | The commands that print: the library's calls with the lines `smp-client-nv` writes, and a code in place of a `Result`. |
 | `smpcli` | The commands of the `smp-client-nv` program, and the exit status. |
 | `update` | `novo update`: the command line, the board's flash table as the toolchain prints it, the listing of serial ports and of devices, and the upload with its trial, restart and confirmation. |
@@ -322,7 +351,7 @@ one on PATH, with the socket of the bridge in front of the Controller
 - There is no call that lists the files of a volume: the file group of SMP has
   no such command, and the server of mcumgr-nv offers none.  A file is named by
   its absolute path.
-- The package has no Bluetooth Low Energy and no UDP, and no reader of the
+- The package has no radio and no UDP, and no reader of the
   statistics, log, shell or settings groups: the server answers 8 (not
   supported) to them.
 
@@ -338,7 +367,9 @@ one on PATH, with the socket of the bridge in front of the Controller
 
 ## Development
 
-The package depends on mcumgr-nv by the registry range `^0.2.0`.
+The package depends on mcumgr-nv by the registry range `^0.2.0` and on ble-central-nv, the trait of `smpgatt`, by a path to the novo-lang
+tree (`../../novo/orbit/ble-central-nv`) until ble-central-nv is published.  `novo pkg publish` refuses a path, so the manifest line becomes
+`ble-central-nv = "^0.1.0"` at publish, after ble-central-nv 0.1.0.
 
 ```bash
 novo pkg build                                    # the smp-client-nv command
@@ -351,6 +382,7 @@ bash tests/coverage.sh
 ```bash
 novo test tests/api_tests.nv        # 16: the library against a script (codes, a lost answer, an answer of another request, a cut packet, a hash that differs, resume, progress) and against the server in the same process
 novo test tests/client_tests.nv     # 16: the commands against a server in the same process, a socket, a pipe, a descriptor, a serial port
+novo test tests/gatt_tests.nv       # 18: the transport over a Central against the server in the same process (every command, writes of 20, 185 and 244 bytes, a response cut at every boundary, a lost, a doubled and a late piece, a link dropped in the middle of an upload and resumed)
 novo test tests/transport_tests.nv  #  4: a packet across a pipe, the framing and the pieces of a write, the opening of a serial port
 novo test tests/update_tests.nv     # 21: the command line, the board, the listing, the flow of an update
 novo test tests/volume_tests.nv     #  1: a data image into the data region and the files of its volume

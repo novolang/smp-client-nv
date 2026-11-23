@@ -5,6 +5,20 @@ All notable changes to smp-client-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## Unreleased (0.1.2)
+
+- `smpgatt`: the `Transport` over a `GattCentral` of ble-central-nv.  `open` connects a peer, discovers the SMP service, asks for the largest MTU
+  and the short connection interval and subscribes; `attach` does the discovery and the subscription on a link the program connected.  `send`
+  writes a packet to the characteristic without a response in pieces of the link's largest write and first drops the notifications that wait and
+  the pieces of an unfinished packet; `recv` joins the notifications of a response by the length in its header, drops bytes at the front that cannot
+  start a response, forgets a packet that stopped, and answers `None` on a timeout and on a link that ended.  `GattLink.lost`, `failure` and
+  `stats` say what happened; `reopen` connects the same peer again on a new link.
+- `Reopen`, a trait in `smptransport`: `lost()` and `reopen(ms)` for a transport whose link ends and is made again.  `GattLink` implements it.
+- `smpdevice`: the server of mcumgr-nv over RAM slots with novoboot's start-up rule, for the suites of a program that speaks SMP, as a `GattCentral`
+  over the double of ble-central-nv whose responses a test splits, loses, doubles and holds back and whose link a test cuts.
+- A dependency on ble-central-nv ^0.1.0, written as a path to the novo-lang tree until that package is published; the line is `"^0.1.0"` at publish.
+- `tests/gatt_tests.nv`, 18 tests.
+
 ## 0.1.1 — 2026-11-22
 
 - `smpapi`: the commands of the OS, image and file groups as functions that return values.  Each takes a `Transport` and `CallOptions` (the time to wait

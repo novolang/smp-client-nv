@@ -1,0 +1,341 @@
+// smpgatt: the SMP transport over the GATT operations of a Central.
+//
+// A device that runs the SMP service of MCUmgr over Bluetooth Low Energy has one service and one characteristic.  A request is written to
+// the characteristic without a response, and the response comes back as notifications.  A packet longer than one write or one notification is
+// cut with no added framing, GATT keeps the order, and the Data Length in the header of the first piece says where the packet ends.
+//
+// `GattLink` implements `Transport` over any `GattCentral` of ble-central-nv: the noble Host on a PC, the Bluetooth API of a phone, or the
+// scripted double of a test.  The package knows no radio; the Central is the program's.
+//
+//   match smpgatt.open(central, peer, smpgatt.options())
+//       Err(e)   => println(e.message())
+//       Ok(link) => println(smpapi.image_list(link, smpapi.options(10000, 3)).is_ok())
+//
+// `open` connects, discovers the service, asks for the largest MTU, asks for the short connection interval, and subscribes.  `send` writes a
+// packet in pieces of `max_write` bytes, each waited for, and first forgets what a response before it left behind: the notifications that are
+// waiting and the pieces of a packet that never ended.  `recv` joins the pieces of one response by the length in its header and answers it
+// whole.  It answers None when no piece arrives within the time, and then forgets the pieces it held; it also answers None when the link has
+// ended.  A command of smpapi.nv that gets None sends its request again, up to its tries, so a piece that was lost costs one request.
+//
+// A link that ended is `lost()`.  The commands of smpapi.nv answer `E_SEND` or `E_NO_ANSWER` for it, which a device that does not answer
+// gives too, so a caller that must tell the two apart asks the link.  `reopen` connects the same peer again on a new link of the same value;
+// an upload that was cut resumes from the offset the device kept (smpapi.nv, `image_upload_to`).
+//
+// What the pieces of a response may look like: a header that is cut over several pieces, a piece that holds the end of one packet and the
+// start of the next, a piece that was lost and one that arrived twice.  A run of bytes whose first eight bytes cannot be the header of a
+// response (reserved bits set, a version the protocol does not define, an operation that is a request) is dropped a byte at a time until
+// a header is found, so a stray tail of an earlier response does not hold up the next.  A piece that arrived twice, or one that was lost and
+// whose gap the next response closed, gives a packet whose body is not whole, which smpapi.nv passes over and asks again.
+
+use std.bytes
+use central
+use session
+use smphdr
+use smptransport
+
+// The UUID of the SMP service.
+pub @tier(app)
+fn service_uuid() -> Uuid
+    central.uuid_from_text("8d53dc1d-1db7-4cd3-868b-8a527460aa84") ?? central.uuid16(0)
+
+// The UUID of the characteristic of the service: Write Without Response and Notify.
+pub @tier(app)
+fn char_uuid() -> Uuid
+    central.uuid_from_text("da2e7828-fbce-4e01-ae9e-261174997c48") ?? central.uuid16(0)
+
+// What `open` and `reopen` ask for and wait: `connect_ms` for the connection, `step_ms` for each discovery, subscription and write, and
+// `want_mtu` as the ATT MTU, which the implementation may lower or ignore.
+pub @value
+struct GattOptions
+    connect_ms: Int
+    step_ms: Int
+    want_mtu: Int
+
+// Ten seconds to connect, five for each step, and the largest MTU the protocol allows.
+pub @tier(app)
+fn options() -> GattOptions
+    GattOptions { connect_ms: 10000, step_ms: 5000, want_mtu: 517 }
+
+// The counts of a link, for a log and a test: the packets sent, the notifications taken, the bytes dropped because they did not start a
+// response or because a piece was missing, and the connections made.
+pub @value
+struct GattStats
+    sent: Int
+    notifications: Int
+    dropped_bytes: Int
+    opens: Int
+
+// What changes with the link.  A struct is a reference, so a `Transport` method, whose receiver is by value, changes it through a local `var`.
+struct LinkState
+    var link: LinkId
+    var chr: CharRef
+    var rx: [u8]
+    var lost: Bool
+    var fail_code: Int
+    var fail_text: Str
+    var sent: Int
+    var notifications: Int
+    var dropped_bytes: Int
+    var opens: Int
+
+// The SMP service of one device, reached through a Central.  `reopen` makes it again after the link ended or the device restarted.
+pub struct GattLink<C: GattCentral[e]>
+    central: C
+    pump: Pump
+    peer: PeerId
+    opts: GattOptions
+    st: LinkState
+
+// The bytes of `p` as the list a write takes.
+@tier(app)
+fn list_of(p: Bytes) -> [u8]
+    var out: [u8] = []
+    for i in 0..bytes.len(p)
+        list.push(out, (bytes.byte_at(p, i) ?? 0) as u8)
+    out
+
+// The bytes of `p` as a packet.
+@tier(app)
+fn packet_of(p: [u8]) -> Bytes
+    var out: [Int] = []
+    for i in 0..list.len(p)
+        list.push(out, p[i] as Int)
+    bytes.from_byte_list(out)
+
+// Whether the 8 bytes of `b` from `at` can be the header of a response: the reserved bits are zero, the version is one the protocol defines
+// and the operation is a response (odd).
+@tier(app)
+fn plausible(b: [u8], at: Int) -> Bool
+    let b0 = b[at] as Int
+    (b0 >> 5) == 0 and ((b0 >> 3) & 3) <= VER_DETAILED and (b0 & 1) == 1
+
+// The length of the packet whose header starts `b`: 0 while `b` holds fewer than 8 bytes.
+@tier(app)
+fn packet_len(b: [u8]) -> Int
+    if list.len(b) < SMP_HDR_BYTES
+        return 0
+    SMP_HDR_BYTES + b[2] as Int * 256 + b[3] as Int
+
+// The Central's side of the SMP service on `link`: finds the characteristic, checks that it takes writes without a response and notifies,
+// subscribes, and makes `link` the link of `g`.
+@tier(app)
+fn attach_link<C: GattCentral[e]>(g: GattLink<C>, link: LinkId) -> ?BleError [e, mutate, time]
+    var st = g.st
+    match session.find_char(g.central, link, service_uuid(), char_uuid())
+        None     =>
+            return Some(central.error(E_NOT_FOUND, "the device has no SMP service"))
+        Some(ch) =>
+            if (ch.props & PROP_WRITE_NO_RSP) == 0 or (ch.props & PROP_NOTIFY) == 0
+                return Some(central.error(E_UNSUPPORTED,
+                    "the SMP characteristic takes no write without a response or does not notify"))
+            match session.subscribe_wait(g.central, g.pump, link, ch.ref, SubMode.Notify, g.opts.step_ms)
+                Some(x) =>
+                    return Some(x)
+                None    => ()
+            st.link = link
+            st.chr = ch.ref
+            st.rx = []
+            st.lost = false
+            st.fail_code = 0
+            st.fail_text = ""
+            st.opens = st.opens + 1
+            None
+
+// Connects to the peer, discovers its services and asks for the MTU and the interval; then `attach_link`.  A link that came up and went
+// wrong is disconnected.
+@tier(app)
+fn bring_up<C: GattCentral[e]>(g: GattLink<C>, connect_ms: Int) -> ?BleError [e, mutate, time]
+    let c = g.central
+    match session.connect_wait(c, g.pump, g.peer, ConnectOptions { timeout_ms: connect_ms, security: Security.Unsecured })
+        Err(x)   => Some(x)
+        Ok(link) =>
+            match session.discover_wait(c, g.pump, link, g.opts.step_ms)
+                Some(x) =>
+                    c.disconnect(link)
+                    return Some(x)
+                None    => ()
+            if g.opts.want_mtu > 23
+                let _ = session.mtu_wait(c, g.pump, link, g.opts.want_mtu, g.opts.step_ms)
+            let _ = c.priority(link, Priority.High)
+            match attach_link(g, link)
+                Some(x) =>
+                    c.disconnect(link)
+                    Some(x)
+                None    => None
+
+// Connects to `peer` and opens its SMP service.
+pub @tier(app)
+fn open<C: GattCentral[e]>(c: C, peer: PeerId,
+                           o: GattOptions) -> Result<GattLink<C>, BleError> [e, mutate, time]
+    let st = LinkState { link: LinkId { id: 0 }, chr: CharRef { link: 0, idx: 0 }, rx: [], lost: true, fail_code: 0, fail_text: "", sent: 0,
+                         notifications: 0, dropped_bytes: 0, opens: 0 }
+    let g = GattLink { central: c, pump: session.pump(), peer: peer, opts: o, st: st }
+    match bring_up(g, o.connect_ms)
+        Some(x) => Err(x)
+        None    => Ok(g)
+
+// Opens the SMP service on a link the program connected and discovered itself.  `peer` is the device the link goes to, which `reopen` connects
+// again.
+pub @tier(app)
+fn attach<C: GattCentral[e]>(c: C, p: Pump, peer: PeerId, link: LinkId,
+                             o: GattOptions) -> Result<GattLink<C>, BleError> [e, mutate, time]
+    let st = LinkState { link: link, chr: CharRef { link: 0, idx: 0 }, rx: [], lost: true, fail_code: 0, fail_text: "", sent: 0,
+                         notifications: 0, dropped_bytes: 0, opens: 0 }
+    let g = GattLink { central: c, pump: p, peer: peer, opts: o, st: st }
+    match attach_link(g, link)
+        Some(x) => Err(x)
+        None    => Ok(g)
+
+impl GattLink
+    // The error that ended the link or failed the last write, None when there has been none.
+    @tier(app)
+    fn failure(self) -> ?BleError
+        if self.st.fail_code == 0
+            return None
+        Some(central.error(self.st.fail_code, self.st.fail_text))
+
+    // The link the transport writes to.
+    @tier(app)
+    fn link(self) -> LinkId
+        self.st.link
+
+    // The counts of the link.
+    @tier(app)
+    fn stats(self) -> GattStats
+        GattStats { sent: self.st.sent, notifications: self.st.notifications, dropped_bytes: self.st.dropped_bytes,
+                    opens: self.st.opens }
+
+    // Ends the link.
+    @tier(app)
+    fn close(self) [e, mutate]
+        var st = self.st
+        if not st.lost
+            self.central.disconnect(st.link)
+            st.lost = true
+
+    // Records an error of a call: a link that ended is lost.
+    @tier(app)
+    fn fail(self, code: Int, text: Str) [mutate]
+        var st = self.st
+        st.fail_code = code
+        st.fail_text = text
+        if code == E_NOT_CONNECTED
+            st.lost = true
+
+    // Records that the link ended, seen as a `Disconnected` in the stream.
+    @tier(app)
+    fn ended(self) [mutate]
+        self.fail(E_NOT_CONNECTED, "the link to the device ended")
+
+    // Takes the notifications that are waiting and drops them: they answer a request that went before.  A `Disconnected` among them ends the link.
+    @tier(app)
+    fn forget_stale(self) [e, mutate, time]
+        var st = self.st
+        for _i in 0..1000
+            match session.await_event(self.central, self.pump, T_NOTIFIED, st.link.id, st.chr.idx, 1)
+                None                    =>
+                    break
+                Some(Notified(_, _, _)) => ()
+                Some(_)                 =>
+                    self.ended()
+                    break
+
+    // Drops what the pump saw of lost notifications: an event `Dropped` says the stream overflowed, and the packet being gathered has a gap.
+    @tier(app)
+    fn forget_overflow(self) [e, mutate, time]
+        var st = self.st
+        match session.await_event(self.central, self.pump, T_DROPPED, 0 - 1, 0 - 1, 0)
+            None    => ()
+            Some(_) =>
+                st.dropped_bytes = st.dropped_bytes + list.len(st.rx)
+                st.rx = []
+
+    // Takes the bytes of a piece into the packet being gathered and drops from its front what cannot start a response.
+    @tier(app)
+    fn take_piece(self, data: [u8]) [mutate]
+        var st = self.st
+        st.notifications = st.notifications + 1
+        for i in 0..list.len(data)
+            list.push(st.rx, data[i])
+        for _s in 0..list.len(st.rx)
+            if list.len(st.rx) < SMP_HDR_BYTES or plausible(st.rx, 0)
+                break
+            st.rx = st.rx[1:list.len(st.rx)]
+            st.dropped_bytes = st.dropped_bytes + 1
+
+    // The whole packet at the front of the bytes gathered, which it leaves; None while the packet is not whole.
+    @tier(app)
+    fn whole(self) -> ?Bytes [mutate]
+        var st = self.st
+        let total = packet_len(st.rx)
+        if total == 0 or list.len(st.rx) < total
+            return None
+        let p = packet_of(st.rx[0:total])
+        st.rx = st.rx[total:list.len(st.rx)]
+        Some(p)
+
+impl Transport[e, time] for GattLink
+    @tier(app)
+    fn send(self, packet: Bytes) -> Bool [e, time, mutate]
+        var st = self.st
+        if st.lost
+            return false
+        st.dropped_bytes = st.dropped_bytes + list.len(st.rx)
+        st.rx = []
+        self.forget_stale()
+        if st.lost
+            return false
+        let data = list_of(packet)
+        st.sent = st.sent + 1
+        match session.write_all(self.central, self.pump, st.link, st.chr, data, false, self.opts.step_ms)
+            Some(x) =>
+                self.fail(x.code, x.text)
+                false
+            None    => true
+
+    @tier(app)
+    fn recv(self, ms: Int) -> ?Bytes [e, time, mutate]
+        var st = self.st
+        let t0 = Mono.now()
+        for _i in 0..100000
+            match self.whole()
+                Some(p) =>
+                    return Some(p)
+                None    => ()
+            let left = ms - t0.elapsed().ms()
+            if st.lost or left <= 0
+                break
+            match session.await_event(self.central, self.pump, T_NOTIFIED, st.link.id, st.chr.idx, left)
+                None                       =>
+                    break
+                Some(Notified(_, _, data)) =>
+                    self.forget_overflow()
+                    self.take_piece(data)
+                Some(_)                    =>
+                    self.ended()
+                    break
+        st.dropped_bytes = st.dropped_bytes + list.len(st.rx)
+        st.rx = []
+        None
+
+impl Reopen[e, time] for GattLink
+    @tier(app)
+    fn lost(self) -> Bool
+        self.st.lost
+
+    // Connects the peer again on a link of its own, in place of the one that ended, waiting at most `ms` for the connection (the options'
+    // time when `ms` is 0).  The old link is disconnected when it was not known to have ended.  Answers whether the service is open.
+    @tier(app)
+    fn reopen(self, ms: Int) -> Bool [e, time, mutate]
+        var st = self.st
+        if not st.lost
+            self.central.disconnect(st.link)
+            st.lost = true
+        var wait = self.opts.connect_ms
+        if ms > 0 and ms < wait
+            wait = ms
+        match bring_up(self, wait)
+            None    => true
+            Some(x) =>
+                self.fail(x.code, x.text)
+                false
