@@ -60,7 +60,7 @@ pub struct Board
     data: Int
 
 // The version of the package, which `novo-update --version` prints; the release's smoke step reads it.
-pub const VERSION = "0.1.2"
+pub const VERSION = "0.1.3"
 
 // A serial port of a USB device, as the system describes it.
 pub struct Port

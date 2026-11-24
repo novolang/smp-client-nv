@@ -9,7 +9,7 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 - The dependency on ble-central-nv is `^0.1.1`.  ble-central-nv 0.1.0 declared no `@tier` on its functions, and a project at the embedded tier that held smp-client-nv 0.1.2
   (`orbit/noble-examples` of the toolchain tree builds the Host on a PC against it) failed its build with E4000 on `uuid16`, `uuid_from_bytes` and `uuid_from_text`, which it
-  never calls.  0.1.1 declares `@tier(app)` on its functions.  The sources of this package are unchanged.
+  never calls.  0.1.1 declares `@tier(app)` on its functions.  The only change in the sources is the version `novo update --version` prints.
 
 ## 0.1.2 — 2026-11-24
 
