@@ -401,7 +401,8 @@ fn index_of(xs: [Int], n: Int) -> Int
 fn drain<T: Transport[e]>(t: T) [e, mutate]
     for _d in 0..MAX_WINDOW
         match t.recv(0)
-            None    => break
+            None    =>
+                break
             Some(_) => ()
 
 // The upload with a window: see `image_upload_to`.
@@ -452,7 +453,7 @@ fn upload_window<T: Transport[e], P: Progress[f]>(t: T, image: Int, file: Bytes,
             next = next + n
             sent = sent + 1
         match t.recv(o.ms)
-            None    =>
+            None     =>
                 // Nothing came: go back to what is acknowledged, one request at a time.
                 quiet = quiet + 1
                 if quiet >= o.tries

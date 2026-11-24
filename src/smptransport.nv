@@ -47,6 +47,7 @@ pub trait Transport[e]
     fn recv(self, ms: Int) -> ?Bytes [e, mutate]
     fn mtu(self) -> Int
         0
+
     // Told by an upload that keeps several requests in flight, `on` when it starts and not when it ends: a transport that drops, before it sends a request,
     // the answers it has not been asked for (the answers to an earlier request) must keep them while it is on.  The default has nothing to keep.
     fn keep_queued(self, on: Bool) [mutate]

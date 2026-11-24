@@ -316,7 +316,11 @@ fn test_a_device_that_answers_nothing_ends_the_upload_after_its_tries() [io, fs,
     let img = fresh_device()
     var t = chaos()
     t.st.drop_request = 1
-    match smpapi.image_upload_to(t, 0, img, smpapi.with_window(smpapi.with_chunk(smpapi.options(50, 1), 200), 4), smpapi.Silent { id: 0 })
+    match smpapi.image_upload_to(t,
+        0,
+        img,
+        smpapi.with_window(smpapi.with_chunk(smpapi.options(50, 1), 200), 4),
+        smpapi.Silent { id: 0 })
         Ok(_)  => test.fail("the upload ended well")
         Err(x) => test.assert_eq(x.code, E_NO_ANSWER)
 
