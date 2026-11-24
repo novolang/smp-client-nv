@@ -5,6 +5,12 @@ All notable changes to smp-client-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.3 — 2026-11-24
+
+- The dependency on ble-central-nv is `^0.1.1`.  ble-central-nv 0.1.0 declared no `@tier` on its functions, and a project at the embedded tier that held smp-client-nv 0.1.2
+  (`orbit/noble-examples` of the toolchain tree builds the Host on a PC against it) failed its build with E4000 on `uuid16`, `uuid_from_bytes` and `uuid_from_text`, which it
+  never calls.  0.1.1 declares `@tier(app)` on its functions.  The sources of this package are unchanged.
+
 ## 0.1.2 — 2026-11-24
 
 - `CallOptions.window` and `with_window`: an upload keeps up to `window` requests in flight (default 4, 1 is the stop-and-wait of before) and is go-back-N on the `off` of the
