@@ -5,7 +5,7 @@ All notable changes to smp-client-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased (0.1.2)
+## 0.1.2 — 2026-11-24
 
 - `CallOptions.window` and `with_window`: an upload keeps up to `window` requests in flight (default 4, 1 is the stop-and-wait of before) and is go-back-N on the `off` of the
   responses; `Upload.resent` and `Report.resent` count the requests sent again; `Transport.keep_queued` (default: nothing) tells a transport to keep the answers that wait.

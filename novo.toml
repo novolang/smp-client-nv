@@ -1,6 +1,6 @@
 [package]
 name        = "smp-client-nv"
-version     = "0.1.1"
+version     = "0.1.2"
 description = "The client half of SMP, the Simple Management Protocol of MCUmgr: a library whose commands of the OS, image and file groups return values, with upload, resume and progress, over a Transport trait that has the console framing over a serial port, a pty or a TCP socket, the packets as they are over a pipe and a script for tests and, over the Central of ble-central-nv, Bluetooth Low Energy, and a program may implement it for another link; and two programs: smp-client-nv, which also packs the file nRF Connect Device Manager reads, and novo-update, which the toolchain runs as `novo update` to update a board and write its data region."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -33,7 +33,5 @@ mcumgr-nv = "^0.2.0"
 # The Central that smpgatt.nv carries SMP over: the GATT operations of Bluetooth LE as a trait, which the noble Host, a phone's Bluetooth API
 # and a test double implement.  The package holds no stack, so the README's statement that this package knows no radio stays true.
 #
-# A path while ble-central-nv is not on the registry: the package lives in orbit/ of the novo-lang tree, and the path is the one of the tree
-# beside the satellites.  `novo pkg publish` refuses a path, so at publish the line becomes `ble-central-nv = "^0.1.0"` and ble-central-nv
-# 0.1.0 is published first.
-ble-central-nv = { path = "../../novo/orbit/ble-central-nv" }
+# ble-central-nv 0.1.0 is on the registry, so the dependency is its caret range.
+ble-central-nv = "^0.1.0"
