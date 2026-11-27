@@ -8,10 +8,11 @@
 //
 //   --serial [PORT]   the board's serial port, in the console framing of SMP.  Without a PORT the
 //                     serial ports of attached USB boards are listed, and the one there is, is used.
-//   --ble [ADDRESS]   the SMP service of a device over Bluetooth Low Energy, through a relay
-//                     program that has a Controller (the program `ble_smp` of noble-examples).  Without an
-//                     ADDRESS the relay scans for devices that advertise the service, the devices
-//                     are listed, and the one there is, is used.
+//   --ble [ADDRESS]   the SMP service of a device over Bluetooth Low Energy.  The command runs the program
+//                     `novo-update-ble` (noble-examples, pc/update_ble.nv) with its own command line: that program is a
+//                     Central through a Controller (`run_central` below) and carries the commands over `smpgatt`, with no
+//                     relay process between.  Without an ADDRESS it scans for devices that advertise the service, lists
+//                     them, and uses the one there is.
 //   --tcp HOST:PORT   a server on a socket, such as mcumgr-nv's host server.
 //
 // A FILE alone is an upload to the second slot: a NOVB image (`novo build --role=application`
@@ -30,7 +31,9 @@
 //
 // With a FILE or `upload`, --test marks the new image for a trial and resets the board, and --confirm
 // waits for the board to answer again and confirms the image that runs; --confirm alone makes the
-// staged image permanent and resets.  --baud N (115200), --timeout MS (10000), --tries N (3) and
+// staged image permanent and resets.  The upload with --test and --confirm is the flow of `smpflow`, which the upgrade app of
+// a phone runs too: the step that follows is derived from what the board's image list says, so a link that drops and a board
+// that restarts are met by trying again.  --baud N (115200), --timeout MS (10000), --tries N (3) and
 // --wait SECONDS (120, how long to wait for the board after a reset: the swap of a 340 KB image takes 63 s on the nRF54LM20-DK) are the other options.
 //
 // The board's [flash] table is read from the toolchain (`novo bsp flash --target BOARD --json`), so
@@ -46,7 +49,12 @@ use std.json
 use std.path
 use std.process
 use std.time
+use central
+use smpapi
+use smpclient
 use smpcli
+use smpflow
+use smpgatt
 use smppack
 use smptransport
 
@@ -60,7 +68,7 @@ pub struct Board
     data: Int
 
 // The version of the package, which `novo-update --version` prints; the release's smoke step reads it.
-pub const VERSION = "0.1.3"
+pub const VERSION = "0.1.4"
 
 // A serial port of a USB device, as the system describes it.
 pub struct Port
@@ -331,10 +339,10 @@ fn addresses_of(lines: [Str]) -> [Str]
                 list.push(out, w)
     out
 
-// The program that reaches a device over Bluetooth: `NOVO_UPDATE_BLE`, else `novo-update-ble` beside the
-// toolchain, else the name, which the system looks up on PATH.
+// The program that carries the command over Bluetooth: `NOVO_UPDATE_BLE`, else `novo-update-ble` beside the
+// toolchain, else the name, which the system looks up on PATH.  It is a Central through a Controller and runs `run_central`.
 @tier(app)
-fn relay_program() -> Str [io, fs]
+fn ble_program() -> Str [io, fs]
     let named = env.get("NOVO_UPDATE_BLE") ?? ""
     if named != ""
         return named
@@ -345,7 +353,7 @@ fn relay_program() -> Str [io, fs]
             return beside
     "novo-update-ble"
 
-// The socket of the bridge in front of the Controller the relay uses.
+// The socket of the bridge in front of the Controller the Bluetooth program uses, or the adapter it opens (`hci0`).
 @tier(app)
 fn hci_socket() -> Str [io]
     let named = env.get("NOVO_HCI_SOCKET") ?? ""
@@ -353,40 +361,29 @@ fn hci_socket() -> Str [io]
         return named
     "/tmp/novo_hci.sock"
 
-// The lines the relay prints in a scan.
-@tier(app)
-fn scan_lines() -> [Str] [io, fs]
-    var lines: [Str] = []
-    match smptransport.spawn_pipe([relay_program(), hci_socket(), "scan"])
-        None       => ()
-        Some(pipe) =>
-            var line = ""
-            for _b in 0..100000
-                let c = pipe.wire.recv(20000)
-                if c < 0
-                    break
-                if c == '\n'
-                    if line != ""
-                        list.push(lines, line)
-                    line = ""
-                else
-                    line = line + str.from_char(c)
-            proc.close(pipe.wire.pid)
-    lines
+// The exit status of a shell that could not start the program.
+const NOT_STARTED = 127
 
-// Lists the devices that advertise the service and answers their addresses.
+// Runs the Bluetooth program with the command line it was given, on this program's own input, output and error, and answers its
+// exit status, which is the command's.  3 when the program cannot be started.
 @tier(app)
-fn scan_ble() -> [Str] [io, fs]
-    let lines = scan_lines()
-    for l in lines
-        println(l)
-    addresses_of(lines)
+fn through_ble(args: [Str]) -> Int [io, fs]
+    let prog = ble_program()
+    var cmd = "${shell_quote(prog)} ${shell_quote(hci_socket())}"
+    for a in args
+        cmd = "${cmd} ${shell_quote(a)}"
+    let rc = process.exec(cmd)
+    if rc == NOT_STARTED
+        eprintln("novo update: cannot start ${prog}")
+        return 3
+    rc
 
-// The hash of the image in `file`, hexadecimal: bytes 0x20 to 0x3F of the NOVB header, in a package as well.
+// The hash of the image in `file`, hexadecimal: bytes 0x20 to 0x3F of the NOVB header, in a package as well; "" for a file that is none.
 pub @tier(app)
 fn image_hash(file: Bytes) -> Str
-    let img = smppack.unwrap(file)
-    bytes.to_hex(bytes.slice(img, 0x20, 0x40))
+    match smpflow.candidate(file)
+        None    => ""
+        Some(c) => c.hex
 
 // The hash of the image in the file `path`, or "" when the file cannot be read.
 pub @tier(app)
@@ -465,42 +462,115 @@ fn execute<T: Transport[e]>(t: T, s: [Step], ms: Int, tries: Int) -> Int [io, fs
             return rc
     0
 
-// The code of "the board cannot be reached", which `over_link` answers after it has said why.
+// The code of "the board cannot be reached", which the links answer after they have said why.
 const UNREACHED = 0 - 3
+
+// The link of a serial port or a TCP socket, which a flow opens again when the board has restarted.  A struct is a reference, so the
+// transport methods, whose receiver is by value, change the link through a local `var`.
+struct LinkState
+    var ser: ?Framed<DevWire>
+    var tcp: ?Framed<TcpWire>
+    var lost: Bool
+
+// The serial or TCP link `o` names, as a `Transport` that is also a `Reopen`.
+pub struct Relink
+    o: Opts
+    addr: Str
+    st: LinkState
+
+// Opens the link `o` names at `addr`.  Answers whether it is open; the reason is said to the caller.
+@tier(app)
+fn reach(r: Relink) -> Bool [io, fs, net, mutate]
+    var st = r.st
+    if r.o.link == "serial"
+        match smptransport.open_serial(r.addr, r.o.baud)
+            None    =>
+                eprintln("novo update: cannot open ${r.addr}")
+                return false
+            Some(t) =>
+                st.ser = Some(t)
+                st.lost = false
+                return true
+    let parts = str.split(r.addr, ":")
+    if parts.len() != 2
+        eprintln("novo update: ${r.addr} is no HOST:PORT")
+        return false
+    match smptransport.connect(parts[0], number(parts[1], 0), 3000)
+        None    =>
+            eprintln("novo update: cannot connect to ${r.addr}")
+            false
+        Some(t) =>
+            st.tcp = Some(t)
+            st.lost = false
+            true
+
+// Closes what is open.
+@tier(app)
+fn release(r: Relink) [io, fs, net, mutate]
+    var st = r.st
+    match st.ser
+        Some(t) => fs.close(t.wire.fd)
+        None    => ()
+    match st.tcp
+        Some(t) => net.close(t.wire.sock)
+        None    => ()
+    st.ser = None
+    st.tcp = None
+
+impl Transport[io, fs, net] for Relink
+    @tier(app)
+    fn send(self, packet: Bytes) -> Bool [io, fs, net, mutate]
+        var st = self.st
+        var sent = false
+        match st.ser
+            Some(t) =>
+                sent = t.send(packet)
+            None    =>
+                match st.tcp
+                    Some(t) =>
+                        sent = t.send(packet)
+                    None    => ()
+        if not sent
+            st.lost = true
+        sent
+
+    @tier(app)
+    fn recv(self, ms: Int) -> ?Bytes [io, fs, net, mutate]
+        let st = self.st
+        match st.ser
+            Some(t) => t.recv(ms)
+            None    =>
+                match st.tcp
+                    Some(t) => t.recv(ms)
+                    None    => None
+
+impl Reopen[io, fs, net] for Relink
+    @tier(app)
+    fn lost(self) -> Bool
+        self.st.lost
+
+    @tier(app)
+    fn reopen(self, ms: Int) -> Bool [io, fs, net, mutate]
+        release(self)
+        reach(self)
+
+// The link of a serial port or a socket, open: None when it cannot be (the reason is said).
+@tier(app)
+fn relink(o: Opts, addr: Str) -> ?Relink [io, fs, net, mutate]
+    let r = Relink { o: o, addr: addr, st: LinkState { ser: None, tcp: None, lost: true } }
+    if reach(r)
+        return Some(r)
+    None
 
 // Opens the link the options name, runs the steps over it and closes it.  Answers the code of the first
 // step that fails (0 when none does, -1 when no answer came), or UNREACHED.
 @tier(app)
 fn over_link(o: Opts, addr: Str, s: [Step], ms: Int, tries: Int) -> Int [io, fs, net, mutate]
-    if o.link == "serial"
-        match smptransport.open_serial(addr, o.baud)
-            None    =>
-                eprintln("novo update: cannot open ${addr}")
-                return UNREACHED
-            Some(t) =>
-                let rc = execute(t, s, ms, tries)
-                fs.close(t.wire.fd)
-                return rc
-    if o.link == "tcp"
-        let parts = str.split(addr, ":")
-        if parts.len() != 2
-            eprintln("novo update: ${addr} is no HOST:PORT")
-            return UNREACHED
-        match smptransport.connect(parts[0], number(parts[1], 0), 3000)
-            None    =>
-                eprintln("novo update: cannot connect to ${addr}")
-                return UNREACHED
-            Some(t) =>
-                let rc = execute(t, s, ms, tries)
-                net.close(t.wire.sock)
-                return rc
-    match smptransport.spawn_pipe([relay_program(), hci_socket(), "stdio", addr])
-        None    =>
-            eprintln("novo update: cannot start ${relay_program()}")
-            return UNREACHED
+    match relink(o, addr)
+        None    => UNREACHED
         Some(t) =>
             let rc = execute(t, s, ms, tries)
-            proc.close(t.wire.pid)
+            release(t)
             rc
 
 // The exit status for the code of `over_link`.
@@ -526,31 +596,9 @@ fn choose_port(o: Opts, b: Board, sys: Str, dev: Str) -> Str [io, fs]
         eprintln("novo update: name one of these ports with --serial PORT")
     ""
 
-// The device to use: the one named, or the one that advertises the service.  "" when it must be chosen.
-@tier(app)
-fn choose_device(o: Opts) -> Str [io, fs]
-    if o.addr != ""
-        return o.addr
-    let found = scan_ble()
-    if found.len() == 1
-        return found[0]
-    if found.len() == 0
-        eprintln("novo update: no device advertises the SMP service")
-    else
-        eprintln("novo update: name one of these devices with --ble ADDRESS")
-    ""
-
-// The address of the link to use, found by a listing when the options did not name it.  "" on failure.
-@tier(app)
-fn choose_link(o: Opts, b: Board, sys: Str, dev: Str) -> Str [io, fs]
-    if o.link == "serial"
-        return choose_port(o, b, sys, dev)
-    if o.link == "ble"
-        return choose_device(o)
-    o.addr
-
-// The steps of an upload with --test and --confirm: what goes before the board restarts, whether it
-// restarts, and what is done once it answers again.
+// The steps of an upload that does not wait for the board: with --test the image is marked for a trial and the board restarts, with
+// --confirm alone it is made permanent and the board restarts.  An upload with both is the flow of `smpflow` (`run_flow`), which waits
+// for the board and confirms; it is not a list of steps.
 pub @tier(app)
 fn flow(first: [Step], digest: Str, o: Opts) -> [[Step]]
     var one = first[:]
@@ -561,33 +609,109 @@ fn flow(first: [Step], digest: Str, o: Opts) -> [[Step]]
     else
         list.push(one, Step { words: ["image", "confirm", digest], image: 0 })
     list.push(one, Step { words: ["reset"], image: 0 })
-    if o.test and o.confirm
-        return [one, [Step { words: ["image", "confirm"], image: 0 }]]
     [one]
 
-// Waits for the board to answer a list after a reset, for at most `o.wait` seconds.  An attempt may take as long as
-// `o.ms`: over Bluetooth it holds the scan for the device and the connection, a few seconds before the first request goes
-// out, so an attempt of one second never saw an answer.  The seconds are counted on the clock, not by the attempts.
+// The exit status of a flow that ended with `rep`, and what it says on the way out.  `size` is the bytes of the image.
 @tier(app)
-fn wait_for_board(o: Opts, addr: Str) -> Bool [io, fs, net, time, mutate]
-    let t0 = time.ticks_us()
-    for _s in 0..o.wait
-        time.sleep(1.0)
-        if over_link(o, addr, [Step { words: ["image", "list"], image: 0 }], o.ms, 1) == 0
-            return true
-        if (time.ticks_us() - t0) / 1000000 >= o.wait
-            return false
-    // cov: skip — each pass sleeps one second, so the clock check above ends the wait on the pass that reaches `o.wait` seconds, before the loop runs out
-    false
+fn report_exit(rep: smpflow.Report, o: Opts, size: Int) -> Int [io]
+    if rep.requests > 0
+        println("uploaded ${size} bytes in ${rep.requests} requests")
+    match rep.outcome
+        Outcome.Done             => 0
+        Outcome.AlreadyInstalled => 0
+        Outcome.Refused          =>
+            eprintln("novo update: ${rep.why}")
+            2
+        Outcome.NeverReturned    =>
+            eprintln("novo update: the board did not answer within ${o.wait} seconds of its restart")
+            3
+        Outcome.Reverted         =>
+            eprintln("novo update: ${rep.why}")
+            1
+        Outcome.Failed           =>
+            eprintln("novo update: ${rep.why}")
+            if rep.code > 0
+                return 1
+            3
+        _                        =>
+            eprintln("novo update: ${rep.why}")
+            3
+
+// Runs the flow of `smpflow` over `t`: the image of `file` is uploaded (from the offset the board kept), marked for a trial, the
+// board is restarted and waited for for `o.wait` seconds, and the image that runs is confirmed.  Prints the upload and the list
+// of the images when it is done, as the steps did.  The exit status.
+@tier(app)
+fn run_flow<T: Transport[e] + Reopen[f]>(t: T, file: Bytes, o: Opts,
+                                         b: Board) -> Int [io, fs, e, f, time, mutate]
+    match smpflow.candidate(file)
+        None    =>
+            eprintln("novo update: the file is neither a NOVB image nor a package that holds one")
+            2
+        Some(c) =>
+            let base = smpflow.plan(Mode.TestAndConfirm, smpapi.options(o.ms, o.tries))
+            let plan = Plan { mode: base.mode,
+                call: base.call,
+                wait_ms: o.wait * 1000,
+                link_ms: base.link_ms,
+                poll_ms: base.poll_ms,
+                poll_max_ms: base.poll_max_ms,
+                slot_bytes: b.slot_b,
+                refuse_older: false,
+                retries: base.retries }
+            let rep = smpflow.run(t, file, plan, smpflow.new_state(c, Mode.TestAndConfirm), smpapi.Silent { id: 0 }, smpflow.Quiet { id: 0 },
+                smpflow.System { id: 0 })
+            let rc = report_exit(rep, o, c.size)
+            if rc != 0
+                return rc
+            smpcli.status(smpclient.image_list(t, o.ms, o.tries))
+
+// The flow over the serial port or the socket the options name.
+@tier(app)
+fn flow_over_link(o: Opts, addr: Str, file: Str, b: Board) -> Int [io, fs, net, time, mutate]
+    match fs.read_bytes(file)
+        None    =>
+            eprintln("novo update: cannot read ${file}")
+            2
+        Some(f) =>
+            match relink(o, addr)
+                None    => 3
+                Some(t) =>
+                    let rc = run_flow(t, f, o, b)
+                    release(t)
+                    rc
+
+// What the words of the command ask for, checked before a link is opened: the steps, the hash of an image uploaded with --test or
+// --confirm, and, when the command is to end here, its exit status (-1 when it is not).
+struct Job
+    rc: Int
+    steps: [Step]
+    digest: Str
+
+// The job of the words `o` holds, for the board `b`.
+@tier(app)
+fn job_of(o: Opts, b: Board) -> Job [io, fs]
+    let s = steps_of(o.words, o)
+    if s.len() == 0
+        usage()
+        return Job { rc: 2, steps: [], digest: "" }
+    let why = refusal(s, b)
+    if why != ""
+        eprintln("novo update: ${why}")
+        return Job { rc: 2, steps: s, digest: "" }
+    // An upload with --test or --confirm is the upload, the marks, the restart and the confirmation.
+    var digest = ""
+    if s.len() == 1 and s[0].image == 0 and s[0].words.len() == 3 and s[0].words[1] == "upload"
+        digest = file_hash(s[0].words[2])
+    Job { rc: 0 - 1, steps: s, digest: digest }
+
+// Whether the options ask for the flow of `smpflow`: an upload of an image with --test and --confirm.
+@tier(app)
+fn wants_flow(o: Opts, j: Job) -> Bool
+    j.digest != "" and o.test and o.confirm
 
 // The `scan` verb: the ports or the devices, listed.
 @tier(app)
 fn scan(o: Opts, b: Board, sys: Str, dev: Str) -> Int [io, fs]
-    if o.link == "ble"
-        let found = scan_ble()
-        if found.len() == 0
-            return 3
-        return 0
     let found = ports_of(ports(sys, dev), b)
     for p in found
         println(port_line(p))
@@ -614,36 +738,147 @@ fn run_in(args: [Str], sys: Str, dev: Str) -> Int [io, fs, net, time, mutate]
             eprintln("novo update: the toolchain does not know the board ${o.target}, or it has no [flash] table")
             return 2
         Some(b) =>
+            if o.link == "ble"
+                return through_ble(args)
             if o.words[0] == "scan"
                 return scan(o, b, sys, dev)
             if o.link == ""
                 eprintln("novo update: name the link: --serial [PORT], --ble [ADDRESS] or --tcp HOST:PORT")
                 return 2
-            let s = steps_of(o.words, o)
-            if s.len() == 0
-                usage()
-                return 2
-            let why = refusal(s, b)
-            if why != ""
-                eprintln("novo update: ${why}")
-                return 2
-            let addr = choose_link(o, b, sys, dev)
+            let j = job_of(o, b)
+            if j.rc >= 0
+                return j.rc
+            let addr = choose_port_or_addr(o, b, sys, dev)
             if addr == ""
                 return 3
-            // An upload with --test or --confirm is the upload, the marks, the restart and the confirmation.
-            var digest = ""
-            if s.len() == 1 and s[0].image == 0 and s[0].words.len() == 3 and s[0].words[1] == "upload"
-                digest = file_hash(s[0].words[2])
-            let parts = flow(s, digest, o)
-            let rc = over_link(o, addr, parts[0], o.ms, o.tries)
-            if rc != 0 or parts.len() == 1
-                return exit_of(rc)
-            if not wait_for_board(o, addr)
-                eprintln("novo update: the board did not answer within ${o.wait} seconds of its restart")
-                return 3
-            exit_of(over_link(o, addr, parts[1], o.ms, o.tries))
+            if wants_flow(o, j)
+                return flow_over_link(o, addr, j.steps[0].words[2], b)
+            let parts = flow(j.steps, j.digest, o)
+            exit_of(over_link(o, addr, parts[0], o.ms, o.tries))
+
+// The address of the link to use for a serial port or a socket: named, or found by a listing.  "" on failure.
+@tier(app)
+fn choose_port_or_addr(o: Opts, b: Board, sys: Str, dev: Str) -> Str [io, fs]
+    if o.link == "serial"
+        return choose_port(o, b, sys, dev)
+    o.addr
 
 // `run_in` on the system's own description of its serial ports.
 pub @tier(app)
 fn run(args: [Str]) -> Int [io, fs, net, time, mutate]
     run_in(args, "/sys/class/tty", "/dev")
+
+// ── Bluetooth ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+// How long a scan for the devices that advertise the service lasts, in seconds.
+const SCAN_SECONDS = 10
+
+// Scans for `seconds` seconds for the devices that advertise the SMP service and prints one line for each, "name address rssi".
+// Answers their addresses.
+@tier(app)
+fn scan_central<C: GattCentral[e]>(c: C, seconds: Int) -> [Str] [e, io, time, mutate]
+    var lines: [Str] = []
+    match c.scan_start(central.scan_service(smpgatt.service_uuid()))
+        Some(x) =>
+            eprintln("novo update: cannot scan: ${x.message()}")
+            return []
+        None    => ()
+    let t0 = time.ticks_us()
+    var seen: [Str] = []
+    for _i in 0..10000000
+        match c.next_event(100)
+            Some(ScanResult(p, rssi, name, _)) =>
+                if not list.contains(seen, central.peer_key(p))
+                    list.push(seen, central.peer_key(p))
+                    let line = "${name} ${central.peer_key(p)} ${rssi}"
+                    println(line)
+                    list.push(lines, line)
+            _                                  => ()
+        if (time.ticks_us() - t0) / 1000000 >= seconds
+            break
+    c.scan_stop()
+    addresses_of(lines)
+
+// The device to use: the one named, or the one that advertises the service.  "" when it must be chosen.
+@tier(app)
+fn choose_device<C: GattCentral[e]>(c: C, o: Opts, seconds: Int) -> Str [e, io, time, mutate]
+    if o.addr != ""
+        return o.addr
+    let found = scan_central(c, seconds)
+    if found.len() == 1
+        return found[0]
+    if found.len() == 0
+        eprintln("novo update: no device advertises the SMP service")
+    else
+        eprintln("novo update: name one of these devices with --ble ADDRESS")
+    ""
+
+// The upload of `file` with --test and --confirm over the SMP service of `addr`.
+@tier(app)
+fn flow_over_central<C: GattCentral[e]>(c: C, addr: Str, file: Str, o: Opts,
+                                        b: Board) -> Int [e, io, fs, hw, net, async, time, mutate]
+    match fs.read_bytes(file)
+        None    =>
+            eprintln("novo update: cannot read ${file}")
+            2
+        Some(f) =>
+            match smpgatt.open(c, central.peer(addr), smpgatt.options())
+                Err(x)   =>
+                    eprintln("novo update: cannot reach ${addr}: ${x.message()}")
+                    3
+                Ok(link) =>
+                    let rc = run_flow(link, f, o, b)
+                    link.close()
+                    rc
+
+// The steps over the SMP service of `addr`.
+@tier(app)
+fn steps_over_central<C: GattCentral[e]>(c: C, addr: Str, s: [Step],
+                                         o: Opts) -> Int [e, io, fs, hw, net, async, time, mutate]
+    match smpgatt.open(c, central.peer(addr), smpgatt.options())
+        Err(x)   =>
+            eprintln("novo update: cannot reach ${addr}: ${x.message()}")
+            exit_of(UNREACHED)
+        Ok(link) =>
+            let rc = execute(link, s, o.ms, o.tries)
+            link.close()
+            exit_of(rc)
+
+// The program that `novo update --ble` runs: the command line, with no program name, over the Central `c`, which reaches devices through a
+// Controller (the noble Host, in noble-examples).  The commands are those of `run_in`; the link is the SMP service of the device that
+// `--ble ADDRESS` names, or that the scan finds when there is one device.  The exit status.
+pub @tier(app)
+fn run_central<C: GattCentral[e]>(args: [Str],
+                                  c: C) -> Int [e, io, fs, hw, net, async, time, mutate]
+    run_central_in(args, c, SCAN_SECONDS)
+
+// `run_central` with the seconds a scan lasts.
+pub @tier(app)
+fn run_central_in<C: GattCentral[e]>(args: [Str], c: C,
+                                     seconds: Int) -> Int [e, io, fs, hw, net, async, time, mutate]
+    let o = parse(args)
+    if not o.ok or o.words.len() == 0
+        usage()
+        return 2
+    match board_named(o.target)
+        None    =>
+            eprintln("novo update: the toolchain does not know the board ${o.target}, or it has no [flash] table")
+            return 2
+        Some(b) =>
+            if o.link != "ble"
+                eprintln("novo update: this program carries the commands over Bluetooth: name the link with --ble [ADDRESS]")
+                return 2
+            if o.words[0] == "scan"
+                if scan_central(c, seconds).len() == 0
+                    return 3
+                return 0
+            let j = job_of(o, b)
+            if j.rc >= 0
+                return j.rc
+            let addr = choose_device(c, o, seconds)
+            if addr == ""
+                return 3
+            if wants_flow(o, j)
+                return flow_over_central(c, addr, j.steps[0].words[2], o, b)
+            let parts = flow(j.steps, j.digest, o)
+            steps_over_central(c, addr, parts[0], o)

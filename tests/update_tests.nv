@@ -4,8 +4,10 @@
 //
 // The steps run against a server in the same process (a session of mcumgr-nv over RAM slots).  The links run
 // against stand-ins a test makes: a loopback in the framing (a FIFO opened for reading and writing as a serial
-// port, a socket to an echoing program), and a relay that echoes the packets it is given.  An echoed request is
-// an answer the client accepts: it carries the request's sequence number and no error.
+// port, a socket to an echoing program).  An echoed request is an answer the client accepts: it carries the request's
+// sequence number and no error.  The flow of an upload with --test and --confirm runs over the device of smpdevice.nv in the same
+// process, over a link that can be opened again (smpdirect.nv) and over the Central that device sits behind (the double of
+// ble-central-nv).  The program for Bluetooth is a script a test names, which is run with the command line.
 
 use std.test
 use std.bytes
@@ -23,6 +25,11 @@ use smpsim
 use smpram
 use smppack
 use smptransport
+use smpapi
+use smpdevice
+use smpdirect
+use smpflow
+use scripted
 use update
 
 let CHIP  = 0x413
@@ -277,6 +284,7 @@ fn test_the_hash_of_an_image_is_the_same_in_a_package() [io, fs]
     test.assert_eq(str.len(h), 64)
     test.assert_eq(update.image_hash(smppack.wrap(img)), h)
     test.assert_eq(h, bytes.to_hex(bytes.slice(img, 0x20, 0x40)))
+    test.assert_eq(update.image_hash(bytes.zeros(100)), "")
 
 @test
 fn test_the_hash_of_a_file_is_empty_when_it_cannot_be_read() [io, fs]
@@ -288,7 +296,7 @@ fn test_the_hash_of_a_file_is_empty_when_it_cannot_be_read() [io, fs]
     let _ = fs.delete(file)
 
 @test
-fn test_an_upload_with_test_and_confirm_is_split_at_the_restart() [io, fs]
+fn test_an_upload_with_test_or_confirm_adds_the_marks_and_the_restart() [io, fs]
     let first = [update.Step { words: ["image", "upload", "x"], image: 0 }]
     let plain = update.flow(first, "ab", update.parse([]))
     test.assert_eq(plain.len(), 1)
@@ -304,11 +312,10 @@ fn test_an_upload_with_test_and_confirm_is_split_at_the_restart() [io, fs]
     test.assert_eq(c.len(), 1)
     test.assert_eq(c[0][1].words[1], "confirm")
     test.assert_eq(c[0][1].words[2], "ab")
+    // With both flags the upload is the flow of smpflow, which waits for the board: the steps hold the trial alone.
     let both = update.flow(first, "ab", update.parse(["--test", "--confirm"]))
-    test.assert_eq(both.len(), 2)
+    test.assert_eq(both.len(), 1)
     test.assert_eq(both[0][1].words[1], "test")
-    test.assert_eq(both[1][0].words.len(), 2)
-    test.assert_eq(both[1][0].words[1], "confirm")
 
 @test
 fn test_the_serial_ports_of_usb_boards_are_listed() [io, fs]
@@ -455,13 +462,12 @@ fn test_the_scan_lists_ports_and_devices() [io, fs, net, time, mutate]
     test.assert_eq(update.run_in(["scan", "--serial"], sys, dev), 0)
     test.assert_eq(update.run_in(["scan"], sys, dev), 0)
 
-    test.case("the devices that advertise the service, from the relay")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_scan",
-        "echo 'NovoFOTA 00:11:22:33:44:AA -52'; echo 'NovoFOTA 00:11:22:33:44:BB -60'; echo; echo 'quiet one'"))
+    test.case("the devices that advertise the service: the Bluetooth program runs the scan and its status is the scan's")
+    process.env_set("NOVO_UPDATE_BLE", script("ble_scan", "echo 'NovoFOTA 00:11:22:33:44:AA -52'; exit 0"))
     test.assert_eq(update.run_in(["scan", "--ble"], sys, dev), 0)
-    process.env_set("NOVO_UPDATE_BLE", script("relay_none", "exit 0"))
+    process.env_set("NOVO_UPDATE_BLE", script("ble_none", "exit 3"))
     test.assert_eq(update.run_in(["scan", "--ble"], sys, dev), 3)
-    process.env_set("NOVO_UPDATE_BLE", "/no/such/relay")
+    process.env_set("NOVO_UPDATE_BLE", "/no/such/program")
     test.assert_eq(update.run_in(["scan", "--ble"], sys, dev), 3)
     process.env_set("NOVO_UPDATE_BLE", "")
 
@@ -528,63 +534,52 @@ fn test_a_socket_is_reached_and_closed() [io, fs, net, time, mutate]
     let _ = fs.delete(echo)
 
 @test
-fn test_a_relay_carries_the_packets_of_an_update_and_the_restart_is_waited_for() [io, fs, net, time, mutate]
+fn test_the_bluetooth_program_is_run_with_the_command_line_and_its_status_is_the_commands() [io, fs, net, time, mutate]
     process.env_set("NOVO_PROBE", "")
     process.env_set("NOVO", "")
+    process.env_set("NOVO_HCI_SOCKET", "")
     let sys = tmp("ble_sys")
     let dev = tmp("ble_dev")
     let addr = "00:11:22:33:44:AA"
-    process.env_set("NOVO_UPDATE_BLE", script("relay_echo", "exec cat"))
-    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
+    let trail = tmp("ble_args.log")
+    let _ = fs.delete(trail)
 
-    test.case("a device found by the scan is the one used")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_one",
-        "if [ \"$2\" = scan ]; then echo 'NovoFOTA 00:11:22:33:44:AA -52'; else exec cat; fi"))
-    test.assert_eq(update.run_in(["--ble", "--timeout", "500", "--tries", "1", "list"], sys, dev), 0)
-
-    test.case("two devices: the user chooses; none: nothing to update")
+    test.case("the bridge's socket first, then the words of the command, each one word")
     process.env_set("NOVO_UPDATE_BLE",
-        script("relay_two", "echo 'A 00:11:22:33:44:AA -52'; echo 'B 00:11:22:33:44:BB -60'"))
-    test.assert_eq(update.run_in(["--ble", "list"], sys, dev), 3)
-    process.env_set("NOVO_UPDATE_BLE", script("relay_nobody", "exit 0"))
-    test.assert_eq(update.run_in(["--ble", "list"], sys, dev), 3)
+        script("ble_args", "echo \"[$1] [$2] [$3] [$4] [$5] [$6] [$7]\" >> ${trail}; exit 0"))
+    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "list"], sys, dev), 0)
+    let said = fs.read_or(trail, "")
+    test.assert(str.contains(said, "[/tmp/novo_hci.sock]"))
+    test.assert(str.contains(said, "[--ble]"))
+    test.assert(str.contains(said, "[${addr}]"))
+    test.assert(str.contains(said, "[list]"))
 
-    test.case("an upload, a trial, the restart and the confirmation")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_echo2", "exec cat"))
-    let file = tmp("flow.img")
-    put(file, image(0x01020003, 300, 5))
-    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "--wait", "3", "--test", "--confirm", file],
-        sys,
-        dev),
-    0)
-    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "500", "--tries", "1", "--test", file], sys, dev),
-        0)
-    let _ = fs.delete(file)
+    test.case("a name that needs the shell's quoting reaches the program as it is")
+    let _ = fs.delete(trail)
+    process.env_set("NOVO_UPDATE_BLE", script("ble_quote", "echo \"[$5]\" >> ${trail}; exit 0"))
+    test.assert_eq(update.run_in(["--ble", addr, "echo", "it's here"], sys, dev), 0)
+    test.assert(str.contains(fs.read_or(trail, ""), "[it's here]"))
 
-    test.case("a board that does not come back")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_once",
-        "if [ -e ${tmp("relay_once.seen")} ]; then exit 0; fi; : > ${tmp("relay_once.seen")}; exec cat"))
-    let again = tmp("again.img")
-    put(again, image(0x01020003, 100, 6))
-    test.assert_eq(update.run_in(["--ble", addr, "--timeout", "300", "--tries", "1", "--wait", "1", "--test", "--confirm", again],
-        sys,
-        dev),
-    3)
-    let _ = fs.delete(again)
+    test.case("the status of the program is the status of the command")
+    process.env_set("NOVO_UPDATE_BLE", script("ble_one", "exit 1"))
+    test.assert_eq(update.run_in(["--ble", addr, "list"], sys, dev), 1)
+    process.env_set("NOVO_UPDATE_BLE", script("ble_two", "exit 2"))
+    test.assert_eq(update.run_in(["--ble", addr, "list"], sys, dev), 2)
 
-    test.case("a relay that cannot start")
-    process.env_set("NOVO_UPDATE_BLE", "/no/such/relay")
+    test.case("a program that cannot start")
+    process.env_set("NOVO_UPDATE_BLE", "/no/such/program")
     test.assert_eq(update.run_in(["--ble", addr, "list"], sys, dev), 3)
     process.env_set("NOVO_UPDATE_BLE", "")
+    let _ = fs.delete(trail)
 
 @test
-fn test_the_relay_is_found_beside_the_toolchain() [io, fs, net, time, mutate]
+fn test_the_bluetooth_program_is_found_beside_the_toolchain() [io, fs, net, time, mutate]
     process.env_set("NOVO_UPDATE_BLE", "")
     let sys = tmp("beside_sys")
     let dev = tmp("beside_dev")
     let bin = tmp("beside_bin")
     test.assert(fs.mkdir_all(bin))
-    test.assert(fs.write("${bin}/novo-update-ble", "#!/bin/sh\nexec cat\n"))
+    test.assert(fs.write("${bin}/novo-update-ble", "#!/bin/sh\nexit 0\n"))
     test.assert(fs.set_file_mode("${bin}/novo-update-ble", 0o755))
     process.env_set("NOVO", "${bin}/novo")
     test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev),
@@ -611,10 +606,10 @@ fn test_the_toolchain_and_the_socket_have_defaults() [io, fs, net, time, mutate]
     test.assert_eq(update.run_in(["--target", "demo", "--tcp", "127.0.0.1:1", "list"], sys, dev), 2)
     process.env_set("PATH", old)
 
-    test.case("the relay is told the socket of the bridge")
+    test.case("the Bluetooth program is told the socket of the bridge")
     let log = tmp("socket.log")
     process.env_set("NOVO_HCI_SOCKET", "/tmp/a_bridge.sock")
-    process.env_set("NOVO_UPDATE_BLE", script("relay_socket", "echo \"$1\" >> ${log}; exec cat"))
+    process.env_set("NOVO_UPDATE_BLE", script("ble_socket", "echo \"$1\" >> ${log}; exit 0"))
     test.assert_eq(update.run_in(["--ble", "00:11:22:33:44:AA", "--timeout", "500", "--tries", "1", "list"], sys, dev),
         0)
     test.assert(str.contains(fs.read_or(log, ""), "/tmp/a_bridge.sock"))
@@ -633,3 +628,339 @@ fn test_the_version_is_the_packages() [io, fs, net, time, mutate]
     test.assert_eq(update.run_in(["--help"], "/none", "/none"), 0)
     test.assert_eq(update.run_in(["-h"], "/none", "/none"), 0)
     test.assert(str.contains(fs.read_or("novo.toml", ""), "version     = \"${update.VERSION}\""))
+
+// ── The flow of smpflow ─────────────────────────────────────────────
+
+let V1 = 0x01000000
+let V2 = 0x02000000
+
+fn nameless() -> update.Board
+    update.Board { name: "", vendor: "", probes: [], serial: "", slot_b: 0, data: 0 }
+
+// A device that runs 1.0.0, and the image 2.0.0 for it.
+fn upgrade_image() -> Bytes [mutate]
+    smpdevice.fresh(V1)
+    smpdevice.image_of(V2, 1500, 3)
+
+fn report(outcome: Outcome, requests: Int, code: Int) -> smpflow.Report
+    smpflow.Report { outcome: outcome,
+        stage: Stage.Done,
+        code: code,
+        why: "a sentence",
+        old_version: "1.0.0",
+        new_version: "2.0.0",
+        requests: requests,
+        resent: 0,
+        resumed_at: 0,
+        reconnects: 0,
+        elapsed_ms: 0,
+        log: [] }
+
+@test
+fn test_a_flow_that_ended_is_an_exit_status_and_a_line() [io, fs]
+    let o = update.parse(["--test", "--confirm", "--wait", "7"])
+    test.assert_eq(update.report_exit(report(Outcome.Done, 4, 0), o, 1500), 0)
+    test.assert_eq(update.report_exit(report(Outcome.AlreadyInstalled, 0, 0), o, 1500), 0)
+    test.assert_eq(update.report_exit(report(Outcome.Refused, 0, 0), o, 1500), 2)
+    test.assert_eq(update.report_exit(report(Outcome.NeverReturned, 3, 0), o, 1500), 3)
+    test.assert_eq(update.report_exit(report(Outcome.Reverted, 3, 0), o, 1500), 1)
+    test.assert_eq(update.report_exit(report(Outcome.Failed, 3, 8), o, 1500), 1)
+    test.assert_eq(update.report_exit(report(Outcome.Failed, 3, 0 - 4), o, 1500), 3)
+    test.assert_eq(update.report_exit(report(Outcome.LinkLost, 3, 0), o, 1500), 3)
+    test.assert_eq(update.report_exit(report(Outcome.Cancelled, 3, 0), o, 1500), 3)
+
+@test
+fn test_the_flow_upgrades_a_device_over_a_link_that_can_be_opened_again() [io, fs, net, mutate, time]
+    let img = upgrade_image()
+    let o = update.parse(["--test", "--confirm", "--wait", "20"])
+    test.assert_eq(update.run_flow(smpdirect.direct(), img, o, nameless()), 0)
+    test.assert(smpdevice.running_confirmed())
+    test.assert_eq(smpdevice.running_hash(), bytes.to_hex(smpapi.expected_hash(img)))
+    test.assert_eq(smpdevice.restarts(), 1)
+
+    test.case("the same image again: nothing is sent but reads")
+    test.assert_eq(update.run_flow(smpdirect.direct(), img, o, nameless()), 0)
+    test.assert_eq(smpdevice.restarts(), 1)
+
+    test.case("a file that is no image")
+    test.assert_eq(update.run_flow(smpdirect.direct(), bytes.zeros(100), o, nameless()), 2)
+
+    test.case("an image the second slot cannot hold")
+    smpdevice.fresh(V1)
+    let small = update.Board { name: "demo", vendor: "", probes: [], serial: "", slot_b: 100, data: 0 }
+    test.assert_eq(update.run_flow(smpdirect.direct(), img, o, small), 2)
+
+    test.case("an image the bootloader reverts")
+    smpdevice.fresh(V1)
+    smpdevice.set_hang(true)
+    test.assert_eq(update.run_flow(smpdirect.direct(), img, o, nameless()), 1)
+    smpdevice.set_hang(false)
+
+    test.case("a board that does not come back")
+    smpdevice.fresh(V1)
+    smpdevice.set_off(1000000)
+    let short = update.parse(["--test", "--confirm", "--wait", "1"])
+    test.assert_eq(update.run_flow(smpdirect.direct(), img, short, nameless()), 3)
+    smpdevice.set_off(0)
+
+// ── A serial port or a socket the flow reaches again ────────────────
+
+@test
+fn test_a_link_that_ended_is_opened_again() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    let dev = tmp("relink_dev")
+    test.assert(fs.mkdir_all(dev))
+    let fifo = "${dev}/ttyACM0"
+    test.assert_eq(process.exec("mkfifo ${fifo}"), 0)
+    let bin = tmp("relink_bin")
+    test.assert(fs.mkdir_all(bin))
+    test.assert(fs.write("${bin}/stty", "#!/bin/sh\nexit 0\n"))
+    test.assert(fs.set_file_mode("${bin}/stty", 0o755))
+    let old_path = process.env("PATH") ?? ""
+    process.env_set("PATH", "${bin}:${old_path}")
+    let o = update.parse(["--serial", fifo, "list"])
+    let packet = bytes.from_byte_list([0x03, 0, 0, 4, 0, 0, 0, 0, 1, 2, 3, 4])
+
+    match update.relink(o, fifo)
+        None    => test.fail("the port is opened")
+        Some(t) =>
+            test.assert(not t.lost())
+            // The FIFO gives back what is written to it, which is a packet in the framing.
+            test.assert(t.send(packet))
+            match t.recv(500)
+                Some(got) => test.assert_eq(bytes.len(got), 12)
+                None      => test.fail("the packet is read back")
+            test.assert(t.reopen(500))
+            test.assert(not t.lost())
+            update.release(t)
+            test.assert(not t.send(packet))
+            test.assert(t.lost())
+            test.assert(t.recv(10) == None)
+            test.assert(t.reopen(500))
+            update.release(t)
+
+    test.case("a port that is gone cannot be opened again")
+    match update.relink(o, "${dev}/ttyACM9")
+        None    => ()
+        Some(_) => test.fail("a port that does not exist is opened")
+    process.env_set("PATH", old_path)
+
+    test.case("a socket: the address must be host:port, and something must listen")
+    let tcp = update.parse(["--tcp", "nowhere", "list"])
+    test.assert(update.relink(tcp, "nowhere") == None)
+    test.assert(update.relink(tcp, "127.0.0.1:1") == None)
+    var port = 0
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            port = net.local_port(server)
+            net.close(server)
+    let py = "import socket\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', ${port}))\ns.listen(1)\nc, _ = s.accept()\nwhile True:\n    d = c.recv(4096)\n    if not d:\n        break\n    c.sendall(d)\n"
+    let echo = tmp("relink_echo.py")
+    test.assert(fs.write(echo, py))
+    match proc.spawn(["python3", echo])
+        None      => test.assert(false)
+        Some(pid) =>
+            time.sleep(1.0)
+            match update.relink(tcp, "127.0.0.1:${port}")
+                None    => test.fail("the socket is reached")
+                Some(t) =>
+                    test.assert(t.send(packet))
+                    match t.recv(500)
+                        Some(got) => test.assert_eq(bytes.len(got), 12)
+                        None      => test.fail("the packet comes back")
+                    update.release(t)
+            proc.close(pid)
+    let _ = fs.delete(echo)
+
+@test
+fn test_an_upload_with_test_and_confirm_over_a_link_that_answers_nothing_useful_ends_in_a_failure() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    process.env_set("NOVO", "")
+    let sys = tmp("flowfail_sys")
+    let dev = tmp("flowfail_dev")
+    let file = tmp("flowfail.img")
+    put(file, image(0x01020003, 300, 5))
+    // Nothing listens: the link cannot be made.
+    test.assert_eq(update.run_in(["--tcp", "127.0.0.1:1", "--timeout", "100", "--tries", "1", "--test", "--confirm", file],
+        sys,
+        dev),
+    3)
+    test.assert_eq(update.run_in(["--tcp", "127.0.0.1:1", "--test", "--confirm", "/no/such/file"], sys, dev), 2)
+    test.assert_eq(update.flow_over_link(update.parse(["--tcp", "x:1"]), "x:1", "/no/such/file", nameless()), 2)
+    var port = 0
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            port = net.local_port(server)
+            net.close(server)
+    let py = "import socket\ns = socket.socket()\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.bind(('127.0.0.1', ${port}))\ns.listen(1)\nc, _ = s.accept()\nwhile True:\n    d = c.recv(4096)\n    if not d:\n        break\n    c.sendall(d)\n"
+    let echo = tmp("flowfail_echo.py")
+    test.assert(fs.write(echo, py))
+    match proc.spawn(["python3", echo])
+        None      => test.assert(false)
+        Some(pid) =>
+            time.sleep(1.0)
+            // A server that echoes lists no image and takes every upload: the flow gives the device up after its uploads.
+            test.assert_eq(update.run_in(["--tcp",
+                "127.0.0.1:${port}",
+                "--timeout",
+                "500",
+                "--tries",
+                "1",
+                "--wait",
+                "2",
+                "--test",
+                "--confirm",
+                file],
+                sys,
+                dev),
+            3)
+            proc.close(pid)
+    let _ = fs.delete(echo)
+    let _ = fs.delete(file)
+
+// ── The Central ─────────────────────────────────────────────────────
+
+fn board_toolchain() -> Str [io, fs]
+    script("board_toolchain", "echo '${BOARD_JSON}'")
+
+@test
+fn test_the_commands_run_over_a_central() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    process.env_set("NOVO", "")
+    let key = smpdevice.peer_key()
+    let img = upgrade_image()
+
+    test.case("a command over the device that is named")
+    var p = smpdevice.periph()
+    test.assert_eq(update.run_central_in(["--ble", key, "list"], p, 0), 0)
+    test.assert_eq(update.run_central_in(["--ble", key, "echo", "hello"], p, 0), 0)
+    test.assert_eq(update.run_central_in(["--ble", key, "frob"], p, 0), 2)
+
+    test.case("a device found by the scan is the one used")
+    p = smpdevice.periph()
+    test.assert_eq(update.run_central_in(["--ble", "list"], p, 0), 0)
+
+    test.case("two devices: the user chooses")
+    p = smpdevice.periph()
+    p.double().add_device("AA:00:00:00:00:02", "Other")
+    test.assert_eq(update.run_central_in(["--ble", "list"], p, 1), 3)
+
+    test.case("no device: nothing to update, and the scan says so")
+    let bare = scripted.scripted()
+    test.assert_eq(update.run_central_in(["--ble", "list"], bare, 0), 3)
+    test.assert_eq(update.run_central_in(["scan", "--ble"], bare, 0), 3)
+    p = smpdevice.periph()
+    test.assert_eq(update.run_central_in(["scan", "--ble"], p, 0), 0)
+
+    test.case("a scan the adapter refuses")
+    p = smpdevice.periph()
+    p.double().refuse("scan_start", 4)
+    test.assert_eq(update.run_central_in(["scan", "--ble"], p, 0), 3)
+
+    test.case("a device that cannot be reached")
+    p = smpdevice.periph()
+    p.double().refuse("discover", 9)
+    test.assert_eq(update.run_central_in(["--ble", key, "list"], p, 0), 3)
+    p = smpdevice.periph()
+    p.double().refuse("discover", 9)
+    let file = tmp("central.img")
+    put(file, img)
+    test.assert_eq(update.run_central_in(["--ble", key, "--test", "--confirm", file], p, 0), 3)
+
+    test.case("the usage, the board and the link that is not Bluetooth")
+    p = smpdevice.periph()
+    test.assert_eq(update.run_central_in([], p, 0), 2)
+    test.assert_eq(update.run_central_in(["list"], p, 0), 2)
+    test.assert_eq(update.run_central_in(["--serial", "list"], p, 0), 2)
+    test.assert_eq(update.run_central_in(["--ble", key, "upload", "/no/such/file"], p, 0), 2)
+    test.assert_eq(update.run_central([], p), 2)
+    test.assert_eq(update.flow_over_central(p, key, "/no/such/file", update.parse(["--ble", key]), nameless()), 2)
+    process.env_set("NOVO", board_toolchain())
+    test.assert_eq(update.run_central_in(["--target", "demo", "--ble", key, "list"], p, 0), 0)
+    process.env_set("NOVO", script("no_board", "exit 1"))
+    test.assert_eq(update.run_central_in(["--target", "demo", "--ble", key, "list"], p, 0), 2)
+    process.env_set("NOVO", "")
+    let _ = fs.delete(file)
+
+@test
+fn test_an_upload_with_test_and_confirm_runs_over_a_central() [io, fs, net, time, mutate]
+    process.env_set("NOVO_PROBE", "")
+    process.env_set("NOVO", "")
+    let key = smpdevice.peer_key()
+    let img = upgrade_image()
+    let file = tmp("central_flow.img")
+    put(file, img)
+    var p = smpdevice.periph()
+    test.assert_eq(update.run_central_in(["--ble", key, "--test", "--confirm", "--wait", "20", "--timeout", "500", file], p, 0),
+        0)
+    test.assert(smpdevice.running_confirmed())
+    test.assert_eq(smpdevice.running_hash(), bytes.to_hex(smpapi.expected_hash(img)))
+
+    test.case("an upload with --test alone, and the steps over the device")
+    smpdevice.fresh(V1)
+    p = smpdevice.periph()
+    test.assert_eq(update.run_central_in(["--ble", key, "--timeout", "500", "upload", file], p, 0), 0)
+    test.assert_eq(update.run_central_in(["--ble", key, "--timeout", "500", "list"], p, 0), 0)
+    let _ = fs.delete(file)
+
+// The Central of a Host on a PC reaches a radio and a socket and waits: the effects its methods declare are those the commands over `run_central`
+// must be able to take, which a Central of the double (effect `mutate` alone) does not show.
+struct Wide
+    inner: smpdevice.Periph
+
+impl GattCentral[hw, io, net, async, time, mutate] for Wide
+    fn caps(self) -> Caps
+        self.inner.caps()
+
+    fn adapter(self) -> AdapterState [hw, io, net, async, time, mutate]
+        self.inner.adapter()
+
+    fn scan_start(self, filter: ScanFilter) -> ?BleError [hw, io, net, async, time, mutate]
+        self.inner.scan_start(filter)
+
+    fn scan_stop(self) [hw, io, net, async, time, mutate]
+        self.inner.scan_stop()
+
+    fn connect(self, p: PeerId,
+               opts: ConnectOptions) -> Result<LinkId, BleError> [hw, io, net, async, time, mutate]
+        self.inner.connect(p, opts)
+
+    fn disconnect(self, link: LinkId) [hw, io, net, async, time, mutate]
+        self.inner.disconnect(link)
+
+    fn discover(self, link: LinkId) -> ?BleError [hw, io, net, async, time, mutate]
+        self.inner.discover(link)
+
+    fn services(self, link: LinkId) -> [ServiceInfo]
+        self.inner.services(link)
+
+    fn read(self, link: LinkId, ch: CharRef) -> ?BleError [hw, io, net, async, time, mutate]
+        self.inner.read(link, ch)
+
+    fn write(self, link: LinkId, ch: CharRef, data: [u8],
+             ack: Bool) -> ?BleError [hw, io, net, async, time, mutate]
+        self.inner.write(link, ch, data, ack)
+
+    fn subscribe(self, link: LinkId, ch: CharRef,
+                 mode: SubMode) -> ?BleError [hw, io, net, async, time, mutate]
+        self.inner.subscribe(link, ch, mode)
+
+    fn request_mtu(self, link: LinkId, mtu: Int) -> ?BleError [hw, io, net, async, time, mutate]
+        self.inner.request_mtu(link, mtu)
+
+    fn max_write(self, link: LinkId, ack: Bool) -> Int
+        self.inner.max_write(link, ack)
+
+    fn priority(self, link: LinkId, p: Priority) -> ?BleError [hw, io, net, async, time, mutate]
+        self.inner.priority(link, p)
+
+    fn next_event(self, timeout_ms: Int) -> ?CentralEvent [hw, io, net, async, time, mutate]
+        self.inner.next_event(timeout_ms)
+
+@test
+fn test_a_central_whose_effects_are_those_of_a_pc_host_runs_the_commands() [hw, io, fs, net, async, time, mutate]
+    smpdevice.fresh(0x01000000)
+    let w = Wide { inner: smpdevice.periph() }
+    test.assert_eq(update.run_central_in(["--ble", smpdevice.peer_key(), "list"], w, 0), 0)

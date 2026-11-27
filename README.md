@@ -169,7 +169,8 @@ of the nRF52840-DK drops a longer one.
 ### A pipe
 
 `spawn_pipe` starts a program and speaks to it in packets through its standard
-input and output.  A relay that holds a Bluetooth Controller is such a program:
+input and output.  A program that holds a Bluetooth Controller is such a program (the Central of `smpgatt` replaces it
+where the program owns the Controller):
 
 ```novo
 use std.bytes
@@ -373,12 +374,25 @@ scans for devices that advertise the SMP service and does the same.  `novo
 update scan` is the listing alone.  The exit status is that of `smp-client-nv`,
 and 3 also for a board that does not answer within `--wait` of its restart.
 
-Bluetooth needs a program that has a Controller.  `novo update --ble` starts the
-relay named by `NOVO_UPDATE_BLE`, else `novo-update-ble` beside `novo`, else the
+Bluetooth needs a program that has a Controller.  `novo update --ble` runs the
+program named by `NOVO_UPDATE_BLE`, else `novo-update-ble` beside `novo`, else the
 one on PATH, with the socket of the bridge in front of the Controller
-(`NOVO_HCI_SOCKET`, `/tmp/novo_hci.sock` when unset).  The relay is the program
-`ble_smp` of noble-examples, built as `novo-update-ble`; it takes `scan` and
-`stdio ADDRESS` after the socket.
+(`NOVO_HCI_SOCKET`, `/tmp/novo_hci.sock` when unset) followed by its own
+command line, on its own input, output and error, and its exit status is the
+command's.  The program is `pc/update_ble.nv` of noble-examples, built as
+`novo-update-ble`: a Central through the noble Host (`central_adapter` of the
+noble package) that calls `update.run_central`, which carries the commands over
+`smpgatt` and runs the upload with `--test` and `--confirm` as the flow of
+`smpflow`, with no relay between.  `novo update scan --ble` and `--ble` without an
+address scan for devices that advertise the SMP service and list them as
+`name address rssi`.
+
+The upload with `--test` and `--confirm` is the flow of `smpflow` on every link:
+the step that follows is derived from the image list of the board, so an
+upload that was cut resumes, a link that dropped or a board that restarted is
+reached again, and a board that came back on the old image is reported (exit
+status 1) instead of waited for.  The upload prints `uploaded N bytes in M
+requests` and, when the flow is done, the image list.
 
 ## The rules a user needs
 

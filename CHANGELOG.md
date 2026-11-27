@@ -5,6 +5,20 @@ All notable changes to smp-client-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.4 — 2026-11-27
+
+- `novo update --ble` carries the commands over `smpgatt` through a Central, with no relay process: the toolchain runs the program `novo-update-ble`
+  (`NOVO_UPDATE_BLE`, else beside `novo`, else on PATH) with the socket of the bridge and the command line, and its exit status is the command's.
+  `update.run_central` (and `run_central_in`, which takes the seconds a scan lasts) is that program's body, generic over `GattCentral`: the scan for the
+  devices that advertise the SMP service, the choice of the one device, the steps and the flow.  The program is `pc/update_ble.nv` of noble-examples, over
+  the noble Host (`central_adapter` of noble).  The relay forms of `ble_smp` (`stdio`, `scan`) are no longer run by `novo update`.
+- An upload with `--test` and `--confirm` is the flow of `smpflow` on every link (serial port, socket, Bluetooth), where `update.nv` kept its own list of
+  steps and its own wait: the step after each is derived from the image list of the board, an upload that was cut resumes, a link that dropped or a board
+  that restarted is reached again (`Relink`, a `Transport` and `Reopen` over the serial port or the socket), and an image the bootloader reverted is
+  reported with exit status 1.  `update.flow` has the steps of `--test` and of `--confirm` alone; `update.wait_for_board` is gone and `image_hash` is the
+  hash of `smpflow.candidate`.  The output of the serial and socket commands is the same, but the image list that `image test` printed in the middle of the
+  flow is not printed; the one after the confirmation is.
+
 ## 0.1.3 — 2026-11-24
 
 - The dependency on ble-central-nv is `^0.1.1`.  ble-central-nv 0.1.0 declared no `@tier` on its functions, and a project at the embedded tier that held smp-client-nv 0.1.2
